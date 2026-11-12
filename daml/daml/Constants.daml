@@ -1,0 +1,36 @@
+module Constants where
+
+_operatorFeePercentage_ : Decimal = 0.15
+_escrowFeePercentage_ : Decimal = 0.01
+_auditorFeePercentage_ : Decimal = 0.02
+
+-- Audit token earning rates, sized so that every event can be checked by at least one party who
+-- sees it. The check prices are in the auditor's AuditCostService.kt.
+
+-- The cheapest query the price formula allows (5,000,000) funds exactly one pricing check.
+_auditTokenQueryRate_ : Decimal = 0.001
+
+_auditTokenRewardRate_ : Decimal = 0.01
+
+-- Paid to every contributor when a contribution is corroborated. The two contributors of a
+-- minimal corroboration together fund one inclusion check over a year.
+_auditTokenCorroborationBonus_ : Int = 20_000
+
+_standardTrustScoreCoefficient_ : Decimal = 1.0
+_brokerTrustScoreCoefficient_ : Decimal = 3.0
+_notaryTrustScoreCoefficient_ : Decimal = 5.0
+_taxAuthorityTrustScoreCoefficient_ : Decimal = 8.0
+
+_redundancyBonusCoefficient_ : Decimal = 0.1
+
+-- Midpoint of [0,1], so the first dispute can move a contributor either way.
+_internalReputationInitial_ : Decimal = 0.5
+
+-- EWMA smoothing factor. The actual step is scaled by how decisive the dispute was, so 0.5 is
+-- only reached when every other party to the dispute was wrong.
+_internalReputationSmoothing_ : Decimal = 0.5
+
+-- Below this many distinct transactions an aggregate effectively names its contributors.
+-- MIN_TRANSACTIONS_FOR_PRIVACY in the backend's Constants.kt mirrors it so the operator can refuse
+-- early, but this is the binding copy: ProposeCost and CompleteQuery both assert it.
+_minTransactionsForPrivacy_ : Int = 3

@@ -1,0 +1,126 @@
+services:
+  canton-domain-db:
+    image: postgres:15-alpine
+    container_name: dsrs-canton-domain-db
+    environment:
+      POSTGRES_DB: canton_domain
+      POSTGRES_USER: canton
+      POSTGRES_PASSWORD: canton
+    ports:
+      - "5460:5432"
+    volumes:
+      - canton_domain_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U canton -d canton_domain"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - dsrs-network
+
+  canton-participant-db:
+    image: postgres:15-alpine
+    container_name: dsrs-canton-participant-db
+    environment:
+      POSTGRES_DB: canton_participant
+      POSTGRES_USER: canton
+      POSTGRES_PASSWORD: canton
+    ports:
+      - "5461:5432"
+    volumes:
+      - canton_participant_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U canton -d canton_participant"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - dsrs-network
+
+  canton:
+    image: dsrs-canton-2.8.12:local
+    container_name: dsrs-canton
+    command: daemon --config /config/canton.conf --bootstrap /config/bootstrap.canton
+    depends_on:
+      canton-domain-db:
+        condition: service_healthy
+      canton-participant-db:
+        condition: service_healthy
+    volumes:
+      - ../canton:/config
+      - ../daml:/daml
+    ports:
+      - "4001:4001"
+      - "4002:4002"
+      - "6865:6865"
+      - "6866:6866"
+    networks:
+      - dsrs-network
+
+  participant1-db:
+    image: postgres:15-alpine
+    container_name: dsrs-participant1-db
+    environment:
+      POSTGRES_DB: participant1_db
+      POSTGRES_USER: participant1
+      POSTGRES_PASSWORD: participant1_secret
+    ports:
+      - "5433:5432"
+    volumes:
+      - participant1_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U participant1 -d participant1_db"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - dsrs-network
+
+  operator-db:
+    image: postgres:15-alpine
+    container_name: dsrs-operator-db
+    environment:
+      POSTGRES_DB: operator_db
+      POSTGRES_USER: operator
+      POSTGRES_PASSWORD: operator_secret
+    ports:
+      - "5450:5432"
+    volumes:
+      - operator_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U operator -d operator_db"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - dsrs-network
+
+  auditor-db:
+    image: postgres:15-alpine
+    container_name: dsrs-auditor-db
+    environment:
+      POSTGRES_DB: auditor_db
+      POSTGRES_USER: auditor
+      POSTGRES_PASSWORD: auditor_secret
+    ports:
+      - "5452:5432"
+    volumes:
+      - auditor_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U auditor -d auditor_db"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - dsrs-network
+
+volumes:
+  canton_domain_data:
+  canton_participant_data:
+  participant1_data:
+  operator_data:
+  auditor_data:
+
+networks:
+  dsrs-network:
+    driver: bridge

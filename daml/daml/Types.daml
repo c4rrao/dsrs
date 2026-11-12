@@ -1,0 +1,158 @@
+module Types where
+
+import DA.Text qualified as T
+import DA.Optional (isSome)
+
+newtype TransactionId = TransactionId Text
+  deriving (Eq, Show, Ord)
+
+-- `show` would include the constructor and quotes.
+unpackTransactionId : TransactionId -> Text
+unpackTransactionId (TransactionId t) = t
+
+-- "Alice::1220ab3f..." -> "Alice". Used to build readable ids; the namespace fingerprint is
+-- the same for every party on the participant, so it adds nothing to an id.
+shortPartyName : Party -> Text
+shortPartyName p = case T.splitOn "::" (partyToText p) of
+  (name :: _) -> name
+  [] -> partyToText p
+
+newtype TrustScore = TrustScore Decimal
+  deriving (Eq, Show, Ord, Additive)
+
+data Range a = Range
+  with
+    from : Optional a
+    to : Optional a
+  deriving (Eq, Show, Ord)
+
+data Role
+  = Buyer
+  | Seller
+  | Broker
+  | Notary
+  | TaxAuthority
+  deriving (Eq, Show, Ord)
+
+data Address = Address
+  with
+    postalCode : Optional Text
+    street : Optional Text
+    city : Optional Text
+    country : Optional Text
+    additionalInfo : Optional Text
+  deriving (Eq, Show, Ord)
+
+data EnergyRating = A | B | C | D | E | F | G
+  deriving (Eq, Show, Ord)
+
+data ContributionData = ContributionData
+  with
+    propertyAddress : Optional Address
+    salePrice : Optional Decimal
+    saleDate : Optional Date
+    propertyType : Optional Text
+    squareMeters : Optional Decimal
+    numberOfRooms : Optional Int
+    yearBuilt : Optional Int
+    energyRating : Optional EnergyRating
+    tags : Optional [Text]
+    additionalInfo : Optional Text
+  deriving (Eq, Show, Ord)
+
+-- The sale date is required because together with the transaction id it identifies the sale.
+-- Other fields may be absent, but a present value has to be possible (a studio has zero rooms).
+-- Kept time-free so templates can use it in `ensure`; see saleDateNotAfter for the date check.
+contributionDataIsValid : ContributionData -> Bool
+contributionDataIsValid d =
+  isSome d.saleDate
+    && optional True (> 0.0) d.salePrice
+    && optional True (> 0.0) d.squareMeters
+    && optional True (>= 0) d.numberOfRooms
+    && optional True (> 0) d.yearBuilt
+
+saleDateNotAfter : Date -> ContributionData -> Bool
+saleDateNotAfter day d = optional True (<= day) d.saleDate
+
+data QueryParams = QueryParams
+  with
+    level : Int -- 1: basic averages, 2: detailed metrics
+    trustScore : Optional (Range Decimal)
+    propertyAddress : Optional [Address]
+    salePrice : Optional (Range Decimal)
+    saleDate : Optional (Range Date)
+    propertyTypes : Optional [Text]
+    squareMeters : Optional (Range Decimal)
+    numberOfRooms : Optional [Int]
+    yearBuilt : Optional (Range Int)
+    energyRating : Optional [EnergyRating]
+    tags : Optional [Text]
+  deriving (Eq, Show, Ord)
+
+data InsightBase = InsightBase
+  with
+    transactionCount : Int
+    avgSalePrice : Optional Decimal
+    avgTrustScore : Optional Decimal
+    avgYearBuilt : Optional Decimal
+    avgSquareMeters : Optional Decimal
+    avgNumberOfRooms : Optional Decimal
+    medianEnergyRating : Optional EnergyRating
+  deriving (Eq, Show, Ord)
+
+data DetailedMetrics = DetailedMetrics
+  with
+    priceRange : Optional (Range Decimal)
+    priceVariance : Optional Decimal
+    medianPrice : Optional Decimal
+    avgPricePerSqm : Optional Decimal
+    pricePerSqmRange : Optional (Range Decimal)
+    yearBuiltRange : Optional (Range Int)
+    sqmRange : Optional (Range Decimal)
+    sqmVariance : Optional Decimal
+    roomsRange : Optional (Range Int)
+    propertyTypeDistribution : Optional [(Text, Int)]
+    energyRatingDistribution : Optional [(EnergyRating, Int)]
+    saleDateRange : Optional (Range Date)
+    cityDistribution : Optional [(Text, Int)]
+    topTags : Optional [(Text, Int)]
+    avgContributorsPerTx : Optional Decimal
+    avgDisputesPerTx : Optional Decimal
+    disputeRate : Optional Decimal
+  deriving (Eq, Show, Ord)
+
+data Insight
+  = Level1 with base : InsightBase
+  | Level2 with base : InsightBase, details : DetailedMetrics
+  deriving (Eq, Show)
+
+insightTransactionCount : Insight -> Int
+insightTransactionCount insight = case insight of
+  Level1 base -> base.transactionCount
+  Level2 base _ -> base.transactionCount
+
+data TokenType
+  = RewardToken
+  | AuditToken
+  deriving (Eq, Show, Ord)
+
+-- Inputs to CalculatePrice. These are selectivities already normalised against the corpus,
+-- not raw filter bounds, since measuring a filter needs a database query the ledger cannot run.
+-- The auditor recomputes each field from its own history and compares them one by one.
+data PricingMetadata = PricingMetadata
+  with
+    numTransactions : Int
+    corpusTransactions : Int
+    -- each in [0,1], 0.0 when the dimension was not filtered
+    addressSelectivity : Decimal
+    salePriceSelectivity : Decimal
+    saleDateSelectivity : Decimal
+    squareMetersSelectivity : Decimal
+    yearBuiltSelectivity : Decimal
+    roomsSelectivity : Decimal
+    propertyTypeSelectivity : Decimal
+    energyRatingSelectivity : Decimal
+    tagsSelectivity : Decimal
+    -- [-1,1] relative to the corpus average trust; the only term that can lower a price
+    trustQuality : Decimal
+  deriving (Eq, Show)

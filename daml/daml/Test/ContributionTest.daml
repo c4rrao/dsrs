@@ -1,0 +1,1775 @@
+module Test.ContributionTest where
+
+import Daml.Script
+import DA.Optional (fromSome, isSome)
+import qualified DA.Map as Map
+import qualified DA.List as List
+import DA.Time (days)
+
+import Types
+import DA.Date (date, Month(..), addDays, toDateUTC)
+import Constants
+import Contribution
+import Token.Mint (TokenMintAuthority(..))
+
+createTestMintAuthority : Party -> Party -> Script (ContractId TokenMintAuthority)
+createTestMintAuthority operator auditor = do
+  submit auditor do
+    createCmd TokenMintAuthority with
+      operator
+      auditor
+
+data TestParties = TestParties with
+  operator : Party
+  auditor : Party
+  buyer : Party
+  seller : Party
+  brokerParty : Party
+  notaryParty : Party
+  taxParty : Party
+
+setupParties : Script TestParties
+setupParties = do
+  operator <- allocateParty "Operator"
+  auditor <- allocateParty "Auditor"
+  buyer <- allocateParty "Buyer"
+  seller <- allocateParty "Seller"
+  brokerParty <- allocateParty "Broker"
+  notaryParty <- allocateParty "Notary"
+  taxParty <- allocateParty "TaxAuthority"
+  pure TestParties{..}
+
+sampleContributionData : ContributionData
+sampleContributionData = ContributionData with
+  propertyAddress = Some Address with
+    postalCode = Some "12345"
+    street = Some "Main Street 1"
+    city = Some "Berlin"
+    country = Some "Germany"
+    additionalInfo = None
+  salePrice = Some 500000.0
+  saleDate = Some (date 1970 Jan 1)  -- script time starts at the epoch, and a sale cannot postdate its report
+  propertyType = Some "Apartment"
+  squareMeters = Some 100.0
+  numberOfRooms = Some 4
+  yearBuilt = Some 2000
+  energyRating = Some B
+  tags = Some ["renovated", "balcony"]
+  additionalInfo = None
+
+differentContributionData : ContributionData
+differentContributionData = ContributionData with
+  propertyAddress = Some Address with
+    postalCode = Some "12345"
+    street = Some "Main Street 1"
+    city = Some "Berlin"
+    country = Some "Germany"
+    additionalInfo = None
+  salePrice = Some 480000.0  -- different price
+  saleDate = Some (date 1970 Jan 1)  -- script time starts at the epoch, and a sale cannot postdate its report
+  propertyType = Some "Apartment"
+  squareMeters = Some 95.0  -- different square meters
+  numberOfRooms = Some 4
+  yearBuilt = Some 2000
+  energyRating = Some B
+  tags = Some ["renovated", "balcony"]
+  additionalInfo = None
+
+makeContributorData : Party -> Role -> ContributorData
+makeContributorData contributor roleInTransaction = ContributorData with
+  contributor
+  roleInTransaction
+  disputeCoefficient = 1.0
+  reputation = 1.0
+
+testAcceptNewContribution : Script ()
+testAcceptNewContribution = do
+  TestParties{..} <- setupParties
+
+  now <- getTime
+
+  requestCid <- submit buyer do
+    createCmd ContributionRequest with
+      requestId = "REQ-001"
+      contributor = buyer
+      operator
+      auditor
+      transactionId = TransactionId "TX-001"
+      contributionData = sampleContributionData
+      roleInTransaction = Buyer
+      requestDate = now
+      createdAt = now
+
+  contributionCid <- submit operator do
+    exerciseCmd requestCid AcceptNewContribution with
+      contributorData = makeContributorData buyer Buyer
+
+  contribution <- queryContractId buyer contributionCid
+  let c = fromSome contribution
+  assertMsg "Contribution should exist" (c.transactionId == TransactionId "TX-001")
+  assertMsg "Trust score should be positive" (c.trustScore.total > 0.0)
+  assertMsg "Should have 1 contributor" (Map.size c.contributorsData == 1)
+
+  pure ()
+
+testMergeContribution : Script ()
+testMergeContribution = do
+  TestParties{..} <- setupParties
+
+  now <- getTime
+
+  tokenMintAuthorityCid <- createTestMintAuthority operator auditor
+
+  requestCid <- submit buyer do
+    createCmd ContributionRequest with
+      requestId = "REQ-002"
+      contributor = buyer
+      operator
+      auditor
+      transactionId = TransactionId "TX-002"
+      contributionData = sampleContributionData
+      roleInTransaction = Buyer
+      requestDate = now
+      createdAt = now
+
+  contributionCid <- submit operator do
+    exerciseCmd requestCid AcceptNewContribution with
+      contributorData = makeContributorData buyer Buyer
+
+  requestCid2 <- submit seller do
+    createCmd ContributionRequest with
+      requestId = "REQ-003"
+      contributor = seller
+      operator
+      auditor
+      transactionId = TransactionId "TX-002"
+      contributionData = sampleContributionData
+      roleInTransaction = Seller
+      requestDate = now
+      createdAt = now
+
+  mergedCid <- submit operator do
+    exerciseCmd requestCid2 MergeContribution with
+      existingContributionCid = contributionCid
+      contributorData = makeContributorData seller Seller
+      tokenMintAuthorityCid
+
+  merged <- queryContractId buyer mergedCid
+  let m = fromSome merged
+  assertMsg "Should have 2 contributors" (Map.size m.contributorsData == 2)
+  assertMsg "Buyer should be a contributor" (buyer `elem` Map.keys m.contributorsData)
+  assertMsg "Seller should be a contributor" (seller `elem` Map.keys m.contributorsData)
+  assertMsg "Trust score should increase with more contributors" (m.trustScore.total > 0.0)
+
+  pure ()
+
+testMergeDifferentTransactionFails : Script ()
+testMergeDifferentTransactionFails = do
+  TestParties{..} <- setupParties
+
+  now <- getTime
+
+  tokenMintAuthorityCid <- createTestMintAuthority operator auditor
+
+  requestCid <- submit buyer do
+    createCmd ContributionRequest with
+      requestId = "REQ-004"
+      contributor = buyer
+      operator
+      auditor
+      transactionId = TransactionId "TX-003"
+      contributionData = sampleContributionData
+      roleInTransaction = Buyer
+      requestDate = now
+      createdAt = now
+
+  contributionCid <- submit operator do
+    exerciseCmd requestCid AcceptNewContribution with
+      contributorData = makeContributorData buyer Buyer
+
+  requestCid2 <- submit seller do
+    createCmd ContributionRequest with
+      requestId = "REQ-005"
+      contributor = seller
+      operator
+      auditor
+      transactionId = TransactionId "TX-DIFFERENT"  -- different transaction
+      contributionData = sampleContributionData
+      roleInTransaction = Seller
+      requestDate = now
+      createdAt = now
+
+  submitMustFail operator do
+    exerciseCmd requestCid2 MergeContribution with
+      existingContributionCid = contributionCid
+      contributorData = makeContributorData seller Seller
+      tokenMintAuthorityCid
+
+  pure ()
+
+testMergeDifferentDataFails : Script ()
+testMergeDifferentDataFails = do
+  TestParties{..} <- setupParties
+
+  now <- getTime
+
+  tokenMintAuthorityCid <- createTestMintAuthority operator auditor
+
+  requestCid <- submit buyer do
+    createCmd ContributionRequest with
+      requestId = "REQ-006"
+      contributor = buyer
+      operator
+      auditor
+      transactionId = TransactionId "TX-004"
+      contributionData = sampleContributionData
+      roleInTransaction = Buyer
+      requestDate = now
+      createdAt = now
+
+  contributionCid <- submit operator do
+    exerciseCmd requestCid AcceptNewContribution with
+      contributorData = makeContributorData buyer Buyer
+
+  requestCid2 <- submit seller do
+    createCmd ContributionRequest with
+      requestId = "REQ-007"
+      contributor = seller
+      operator
+      auditor
+      transactionId = TransactionId "TX-004"
+      contributionData = differentContributionData
+      roleInTransaction = Seller
+      requestDate = now
+      createdAt = now
+
+  submitMustFail operator do
+    exerciseCmd requestCid2 MergeContribution with
+      existingContributionCid = contributionCid
+      contributorData = makeContributorData seller Seller
+      tokenMintAuthorityCid
+
+  pure ()
+
+testMergeSameContributorFails : Script ()
+testMergeSameContributorFails = do
+  TestParties{..} <- setupParties
+
+  now <- getTime
+
+  tokenMintAuthorityCid <- createTestMintAuthority operator auditor
+
+  requestCid <- submit buyer do
+    createCmd ContributionRequest with
+      requestId = "REQ-008"
+      contributor = buyer
+      operator
+      auditor
+      transactionId = TransactionId "TX-005"
+      contributionData = sampleContributionData
+      roleInTransaction = Buyer
+      requestDate = now
+      createdAt = now
+
+  contributionCid <- submit operator do
+    exerciseCmd requestCid AcceptNewContribution with
+      contributorData = makeContributorData buyer Buyer
+
+  requestCid2 <- submit buyer do
+    createCmd ContributionRequest with
+      requestId = "REQ-009"
+      contributor = buyer
+      operator
+      auditor
+      transactionId = TransactionId "TX-005"
+      contributionData = sampleContributionData
+      roleInTransaction = Buyer
+      requestDate = now
+      createdAt = now
+
+  submitMustFail operator do
+    exerciseCmd requestCid2 MergeContribution with
+      existingContributionCid = contributionCid
+      contributorData = makeContributorData buyer Buyer
+      tokenMintAuthorityCid
+
+  pure ()
+
+testRejectContribution : Script ()
+testRejectContribution = do
+  TestParties{..} <- setupParties
+
+  now <- getTime
+
+  requestCid <- submit buyer do
+    createCmd ContributionRequest with
+      requestId = "REQ-010"
+      contributor = buyer
+      operator
+      auditor
+      transactionId = TransactionId "TX-006"
+      contributionData = sampleContributionData
+      roleInTransaction = Buyer
+      requestDate = now
+      createdAt = now
+
+  submit operator do
+    exerciseCmd requestCid RejectContribution with reason = "Invalid data"
+
+  request <- queryContractId buyer requestCid
+  assertMsg "Request should be archived" (request == None)
+
+  pure ()
+
+testWithdrawContribution : Script ()
+testWithdrawContribution = do
+  TestParties{..} <- setupParties
+
+  now <- getTime
+
+  requestCid <- submit buyer do
+    createCmd ContributionRequest with
+      requestId = "REQ-011"
+      contributor = buyer
+      operator
+      auditor
+      transactionId = TransactionId "TX-007"
+      contributionData = sampleContributionData
+      roleInTransaction = Buyer
+      requestDate = now
+      createdAt = now
+
+  submit buyer do
+    exerciseCmd requestCid WithdrawContribution
+
+  request <- queryContractId buyer requestCid
+  assertMsg "Request should be archived" (request == None)
+
+  pure ()
+
+testOpenDispute : Script ()
+testOpenDispute = do
+  TestParties{..} <- setupParties
+
+  now <- getTime
+
+  tokenMintAuthorityCid <- createTestMintAuthority operator auditor
+
+  requestCid <- submit buyer do
+    createCmd ContributionRequest with
+      requestId = "REQ-012"
+      contributor = buyer
+      operator
+      auditor
+      transactionId = TransactionId "TX-008"
+      contributionData = sampleContributionData
+      roleInTransaction = Buyer
+      requestDate = now
+      createdAt = now
+
+  contributionCid <- submit operator do
+    exerciseCmd requestCid AcceptNewContribution with
+      contributorData = makeContributorData buyer Buyer
+
+  requestCid2 <- submit seller do
+    createCmd ContributionRequest with
+      requestId = "REQ-013"
+      contributor = seller
+      operator
+      auditor
+      transactionId = TransactionId "TX-008"
+      contributionData = differentContributionData
+      roleInTransaction = Seller
+      requestDate = now
+      createdAt = now
+
+  disputeCid <- submit operator do
+    exerciseCmd requestCid2 OpenDispute with
+      existingContributionCid = contributionCid
+      contributorData = makeContributorData seller Seller
+      tokenMintAuthorityCid
+
+  dispute <- queryContractId buyer disputeCid
+  let d = fromSome dispute
+  assertMsg "Dispute should have 2 data versions" (length d.allData == 2)
+  assertMsg "Dispute should have 2 contributors" (Map.size d.contributorsData == 2)
+  assertMsg "Dispute reason should not be empty" (d.reason /= "")
+
+  pure ()
+
+testDisputeAutoResolve : Script ()
+testDisputeAutoResolve = do
+  TestParties{..} <- setupParties
+
+  now <- getTime
+
+  tokenMintAuthorityCid <- createTestMintAuthority operator auditor
+
+  requestCid <- submit buyer do
+    createCmd ContributionRequest with
+      requestId = "REQ-014"
+      contributor = buyer
+      operator
+      auditor
+      transactionId = TransactionId "TX-009"
+      contributionData = sampleContributionData
+      roleInTransaction = Buyer
+      requestDate = now
+      createdAt = now
+
+  contributionCid <- submit operator do
+    exerciseCmd requestCid AcceptNewContribution with
+      contributorData = makeContributorData buyer Buyer
+
+  requestCid2 <- submit seller do
+    createCmd ContributionRequest with
+      requestId = "REQ-015"
+      contributor = seller
+      operator
+      auditor
+      transactionId = TransactionId "TX-009"
+      contributionData = differentContributionData
+      roleInTransaction = Seller
+      requestDate = now
+      createdAt = now
+
+  disputeCid <- submit operator do
+    exerciseCmd requestCid2 OpenDispute with
+      existingContributionCid = contributionCid
+      contributorData = makeContributorData seller Seller
+      tokenMintAuthorityCid
+
+  -- voters are not stakeholders of the mint authority, so it is disclosed to them
+  authorityDisclosure <- fromSome <$> queryDisclosure operator tokenMintAuthorityCid
+
+  voteResult1 <- submitWithDisclosures buyer [authorityDisclosure] do
+    exerciseCmd disputeCid Vote with
+      voteForDataIndex = 0
+      voter = buyer
+
+  case voteResult1 of
+    Left newDisputeCid -> do
+      voteResult2 <- submitWithDisclosures seller [authorityDisclosure] do
+        exerciseCmd newDisputeCid Vote with
+          voteForDataIndex = 0  -- Seller changes to match buyer
+          voter = seller
+
+      case voteResult2 of
+        Right resolvedCid -> do
+          resolved <- queryContractId buyer resolvedCid
+          let r = fromSome resolved
+          assertMsg "Contribution should have correct data" (r.contributionData == sampleContributionData)
+          assertMsg "Should have dispute date recorded" (not $ null r.disputeDates)
+        Left _ -> fail "Expected auto-resolution but voting continues"
+
+    Right _ -> fail "Expected voting to continue after first vote"
+
+  pure ()
+
+testAddDisputerToDispute : Script ()
+testAddDisputerToDispute = do
+  TestParties{..} <- setupParties
+
+  now <- getTime
+
+  tokenMintAuthorityCid <- createTestMintAuthority operator auditor
+
+  requestCid <- submit buyer do
+    createCmd ContributionRequest with
+      requestId = "REQ-018"
+      contributor = buyer
+      operator
+      auditor
+      transactionId = TransactionId "TX-011"
+      contributionData = sampleContributionData
+      roleInTransaction = Buyer
+      requestDate = now
+      createdAt = now
+
+  contributionCid <- submit operator do
+    exerciseCmd requestCid AcceptNewContribution with
+      contributorData = makeContributorData buyer Buyer
+
+  requestCid2 <- submit seller do
+    createCmd ContributionRequest with
+      requestId = "REQ-019"
+      contributor = seller
+      operator
+      auditor
+      transactionId = TransactionId "TX-011"
+      contributionData = differentContributionData
+      roleInTransaction = Seller
+      requestDate = now
+      createdAt = now
+
+  disputeCid <- submit operator do
+    exerciseCmd requestCid2 OpenDispute with
+      existingContributionCid = contributionCid
+      contributorData = makeContributorData seller Seller
+      tokenMintAuthorityCid
+
+  updatedDisputeCid <- submit operator do
+    exerciseCmd disputeCid AddDisputer with
+      newContributorData = makeContributorData brokerParty Broker
+      newContributorContributionData = sampleContributionData  -- Broker supports original data
+
+  updatedDispute <- queryContractId buyer updatedDisputeCid
+  let ud = fromSome updatedDispute
+  assertMsg "Should have 3 contributors" (Map.size ud.contributorsData == 3)
+  assertMsg "Broker should be in contributors" (brokerParty `elem` Map.keys ud.contributorsData)
+
+  pure ()
+
+testAddDisputerWithNewDataToDispute : Script ()
+testAddDisputerWithNewDataToDispute = do
+  TestParties{..} <- setupParties
+
+  now <- getTime
+
+  tokenMintAuthorityCid <- createTestMintAuthority operator auditor
+
+  requestCid <- submit buyer do
+    createCmd ContributionRequest with
+      requestId = "REQ-020"
+      contributor = buyer
+      operator
+      auditor
+      transactionId = TransactionId "TX-012"
+      contributionData = sampleContributionData
+      roleInTransaction = Buyer
+      requestDate = now
+      createdAt = now
+
+  contributionCid <- submit operator do
+    exerciseCmd requestCid AcceptNewContribution with
+      contributorData = makeContributorData buyer Buyer
+
+  requestCid2 <- submit seller do
+    createCmd ContributionRequest with
+      requestId = "REQ-021"
+      contributor = seller
+      operator
+      auditor
+      transactionId = TransactionId "TX-012"
+      contributionData = differentContributionData
+      roleInTransaction = Seller
+      requestDate = now
+      createdAt = now
+
+  disputeCid <- submit operator do
+    exerciseCmd requestCid2 OpenDispute with
+      existingContributionCid = contributionCid
+      contributorData = makeContributorData seller Seller
+      tokenMintAuthorityCid
+
+  let thirdVersionData = sampleContributionData with salePrice = Some 520000.0
+
+  updatedDisputeCid <- submit operator do
+    exerciseCmd disputeCid AddDisputer with
+      newContributorData = makeContributorData brokerParty Broker
+      newContributorContributionData = thirdVersionData
+
+  updatedDispute <- queryContractId buyer updatedDisputeCid
+  let ud = fromSome updatedDispute
+  assertMsg "Should have 3 data versions" (length ud.allData == 3)
+
+  pure ()
+
+testProposeDisputeDataNewAlternative : Script ()
+testProposeDisputeDataNewAlternative = do
+  TestParties{..} <- setupParties
+
+  now <- getTime
+
+  tokenMintAuthorityCid <- createTestMintAuthority operator auditor
+
+  requestCid <- submit buyer do
+    createCmd ContributionRequest with
+      requestId = "REQ-040"
+      contributor = buyer
+      operator
+      auditor
+      transactionId = TransactionId "TX-040"
+      contributionData = sampleContributionData
+      roleInTransaction = Buyer
+      requestDate = now
+      createdAt = now
+
+  contributionCid <- submit operator do
+    exerciseCmd requestCid AcceptNewContribution with
+      contributorData = makeContributorData buyer Buyer
+
+  requestCid2 <- submit seller do
+    createCmd ContributionRequest with
+      requestId = "REQ-041"
+      contributor = seller
+      operator
+      auditor
+      transactionId = TransactionId "TX-040"
+      contributionData = differentContributionData
+      roleInTransaction = Seller
+      requestDate = now
+      createdAt = now
+
+  disputeCid <- submit operator do
+    exerciseCmd requestCid2 OpenDispute with
+      existingContributionCid = contributionCid
+      contributorData = makeContributorData seller Seller
+      tokenMintAuthorityCid
+
+  -- the buyer thinks neither option is right and puts a third one forward
+  let realData = sampleContributionData with salePrice = Some 495000.0
+
+  proposeResult <- submit buyer do
+    exerciseCmd disputeCid ProposeDisputeData with
+      proposer = buyer
+      newContributionData = realData
+
+  case proposeResult of
+    Left newDisputeCid -> do
+      updated <- fromSome <$> queryContractId buyer newDisputeCid
+      assertMsg "Should now have 3 data versions" (length updated.allData == 3)
+      assertMsg "Proposed data should be appended as option 2"
+        (List.elemIndex realData updated.allData == Some 2)
+      assertMsg "Proposer should have auto-voted for their own proposal"
+        (Map.lookup buyer updated.votes == Some 2)
+      assertMsg "Proposer's initial position must move onto their own proposal"
+        (Map.lookup buyer updated.initialPositions == Some 2)
+      assertMsg "Other contributors' initial positions must be untouched"
+        (Map.lookup seller updated.initialPositions == Some 1)
+      assertMsg "Contributor set must be unchanged"
+        (Map.keys updated.contributorsData == Map.keys updated.initialPositions)
+    Right _ -> fail "A brand-new alternative can never be unanimous, so voting must continue"
+
+  pure ()
+
+testProposeDisputeDataDeduplicatesAndResolves : Script ()
+testProposeDisputeDataDeduplicatesAndResolves = do
+  TestParties{..} <- setupParties
+
+  now <- getTime
+
+  tokenMintAuthorityCid <- createTestMintAuthority operator auditor
+
+  requestCid <- submit buyer do
+    createCmd ContributionRequest with
+      requestId = "REQ-042"
+      contributor = buyer
+      operator
+      auditor
+      transactionId = TransactionId "TX-041"
+      contributionData = sampleContributionData
+      roleInTransaction = Buyer
+      requestDate = now
+      createdAt = now
+
+  contributionCid <- submit operator do
+    exerciseCmd requestCid AcceptNewContribution with
+      contributorData = makeContributorData buyer Buyer
+
+  requestCid2 <- submit seller do
+    createCmd ContributionRequest with
+      requestId = "REQ-043"
+      contributor = seller
+      operator
+      auditor
+      transactionId = TransactionId "TX-041"
+      contributionData = differentContributionData
+      roleInTransaction = Seller
+      requestDate = now
+      createdAt = now
+
+  disputeCid <- submit operator do
+    exerciseCmd requestCid2 OpenDispute with
+      existingContributionCid = contributionCid
+      contributorData = makeContributorData seller Seller
+      tokenMintAuthorityCid
+
+  authorityDisclosure <- fromSome <$> queryDisclosure operator tokenMintAuthorityCid
+
+  -- proposing the seller's data is a vote for option 1, which makes the dispute unanimous
+  proposeResult <- submitWithDisclosures buyer [authorityDisclosure] do
+    exerciseCmd disputeCid ProposeDisputeData with
+      proposer = buyer
+      newContributionData = differentContributionData
+
+  case proposeResult of
+    Right resolvedCid -> do
+      resolved <- fromSome <$> queryContractId buyer resolvedCid
+      assertMsg "Resolved contribution should carry the agreed-on data"
+        (resolved.contributionData == differentContributionData)
+      assertMsg "Should have recorded a dispute date" (not $ null resolved.disputeDates)
+    Left disputeCid' -> do
+      d <- fromSome <$> queryContractId buyer disputeCid'
+      fail ("Expected resolution, still open with " <> show (length d.allData) <> " options")
+
+  pure ()
+
+-- Proposing the option the dispute settles on makes the proposer a winner, even though their
+-- original submission was wrong.
+testProposeDisputeDataProposerWinsOnTheirOwnProposal : Script ()
+testProposeDisputeDataProposerWinsOnTheirOwnProposal = do
+  TestParties{..} <- setupParties
+
+  now <- getTime
+
+  tokenMintAuthorityCid <- createTestMintAuthority operator auditor
+
+  requestCid <- submit buyer do
+    createCmd ContributionRequest with
+      requestId = "REQ-046"
+      contributor = buyer
+      operator
+      auditor
+      transactionId = TransactionId "TX-043"
+      contributionData = sampleContributionData
+      roleInTransaction = Buyer
+      requestDate = now
+      createdAt = now
+
+  contributionCid <- submit operator do
+    exerciseCmd requestCid AcceptNewContribution with
+      contributorData = makeContributorData buyer Buyer
+
+  requestCid2 <- submit seller do
+    createCmd ContributionRequest with
+      requestId = "REQ-047"
+      contributor = seller
+      operator
+      auditor
+      transactionId = TransactionId "TX-043"
+      contributionData = differentContributionData
+      roleInTransaction = Seller
+      requestDate = now
+      createdAt = now
+
+  disputeCid <- submit operator do
+    exerciseCmd requestCid2 OpenDispute with
+      existingContributionCid = contributionCid
+      contributorData = makeContributorData seller Seller
+      tokenMintAuthorityCid
+
+  authorityDisclosure <- fromSome <$> queryDisclosure operator tokenMintAuthorityCid
+
+  let realData = sampleContributionData with salePrice = Some 495000.0
+
+  proposeResult <- submit buyer do
+    exerciseCmd disputeCid ProposeDisputeData with
+      proposer = buyer
+      newContributionData = realData
+
+  disputeCid2 <- case proposeResult of
+    Left cid -> pure cid
+    Right _ -> fail "A brand-new alternative cannot resolve the dispute on its own"
+
+  voteResult <- submitWithDisclosures seller [authorityDisclosure] do
+    exerciseCmd disputeCid2 Vote with
+      voteForDataIndex = 2
+      voter = seller
+
+  case voteResult of
+    Right resolvedCid -> do
+      resolved <- fromSome <$> queryContractId buyer resolvedCid
+      assertMsg "Resolved contribution should carry the proposed data"
+        (resolved.contributionData == realData)
+
+      let coefficient p = (fromSome (Map.lookup p resolved.contributorsData)).disputeCoefficient
+      -- one winner out of two: the step is 0.5 * 0.5 = 0.25 from the starting 0.5
+      assertMsg "Proposer of the winning alternative must be treated as a winner"
+        (coefficient buyer == 0.625)
+      assertMsg "The party who never held the winning option is a loser"
+        (coefficient seller == 0.375)
+    Left _ -> fail "Expected auto-resolution once every contributor voted for option 2"
+
+  pure ()
+
+-- Proposing vacates the proposer's previous position. If the dispute then settles on that
+-- option nobody stands on it, and every reputation must be left unchanged.
+testProposeDisputeDataResolvingOnAVacatedPosition : Script ()
+testProposeDisputeDataResolvingOnAVacatedPosition = do
+  TestParties{..} <- setupParties
+
+  now <- getTime
+
+  tokenMintAuthorityCid <- createTestMintAuthority operator auditor
+
+  requestCid <- submit buyer do
+    createCmd ContributionRequest with
+      requestId = "REQ-048"
+      contributor = buyer
+      operator
+      auditor
+      transactionId = TransactionId "TX-044"
+      contributionData = sampleContributionData
+      roleInTransaction = Buyer
+      requestDate = now
+      createdAt = now
+
+  contributionCid <- submit operator do
+    exerciseCmd requestCid AcceptNewContribution with
+      contributorData = makeContributorData buyer Buyer
+
+  requestCid2 <- submit seller do
+    createCmd ContributionRequest with
+      requestId = "REQ-049"
+      contributor = seller
+      operator
+      auditor
+      transactionId = TransactionId "TX-044"
+      contributionData = differentContributionData
+      roleInTransaction = Seller
+      requestDate = now
+      createdAt = now
+
+  disputeCid <- submit operator do
+    exerciseCmd requestCid2 OpenDispute with
+      existingContributionCid = contributionCid
+      contributorData = makeContributorData seller Seller
+      tokenMintAuthorityCid
+
+  authorityDisclosure <- fromSome <$> queryDisclosure operator tokenMintAuthorityCid
+
+  let thirdData = sampleContributionData with salePrice = Some 495000.0
+
+  proposeResult <- submit buyer do
+    exerciseCmd disputeCid ProposeDisputeData with
+      proposer = buyer
+      newContributionData = thirdData
+
+  disputeCid2 <- case proposeResult of
+    Left cid -> pure cid
+    Right _ -> fail "A brand-new alternative cannot resolve the dispute on its own"
+
+  -- settle on index 0, which nobody holds any more: the buyer moved to 2, the seller is at 1
+  voteResult1 <- submitWithDisclosures buyer [authorityDisclosure] do
+    exerciseCmd disputeCid2 Vote with
+      voteForDataIndex = 0
+      voter = buyer
+
+  disputeCid3 <- case voteResult1 of
+    Left cid -> pure cid
+    Right _ -> fail "Expected voting to continue - the seller has not agreed yet"
+
+  voteResult2 <- submitWithDisclosures seller [authorityDisclosure] do
+    exerciseCmd disputeCid3 Vote with
+      voteForDataIndex = 0
+      voter = seller
+
+  case voteResult2 of
+    Right resolvedCid -> do
+      resolved <- fromSome <$> queryContractId buyer resolvedCid
+      assertMsg "Resolved contribution should carry the original data"
+        (resolved.contributionData == sampleContributionData)
+
+      let coefficients = map (.disputeCoefficient) (Map.values resolved.contributorsData)
+      assertMsg "No contributor may be zeroed out when nobody holds the winning position"
+        (all (> 0.0) coefficients)
+      assertMsg "Nobody held the winning option, so nobody is penalised relative to anyone else"
+        (all (== _internalReputationInitial_) coefficients)
+    Left _ -> fail "Expected auto-resolution once every contributor voted for option 0"
+
+  pure ()
+
+testProposeDisputeDataByNonContributorFails : Script ()
+testProposeDisputeDataByNonContributorFails = do
+  TestParties{..} <- setupParties
+
+  now <- getTime
+
+  tokenMintAuthorityCid <- createTestMintAuthority operator auditor
+
+  requestCid <- submit buyer do
+    createCmd ContributionRequest with
+      requestId = "REQ-044"
+      contributor = buyer
+      operator
+      auditor
+      transactionId = TransactionId "TX-042"
+      contributionData = sampleContributionData
+      roleInTransaction = Buyer
+      requestDate = now
+      createdAt = now
+
+  contributionCid <- submit operator do
+    exerciseCmd requestCid AcceptNewContribution with
+      contributorData = makeContributorData buyer Buyer
+
+  requestCid2 <- submit seller do
+    createCmd ContributionRequest with
+      requestId = "REQ-045"
+      contributor = seller
+      operator
+      auditor
+      transactionId = TransactionId "TX-042"
+      contributionData = differentContributionData
+      roleInTransaction = Seller
+      requestDate = now
+      createdAt = now
+
+  disputeCid <- submit operator do
+    exerciseCmd requestCid2 OpenDispute with
+      existingContributionCid = contributionCid
+      contributorData = makeContributorData seller Seller
+      tokenMintAuthorityCid
+
+  submitMustFail brokerParty do
+    exerciseCmd disputeCid ProposeDisputeData with
+      proposer = brokerParty
+      newContributionData = sampleContributionData with salePrice = Some 600000.0
+
+  pure ()
+
+testInvalidVoteIndexFails : Script ()
+testInvalidVoteIndexFails = do
+  TestParties{..} <- setupParties
+
+  now <- getTime
+
+  tokenMintAuthorityCid <- createTestMintAuthority operator auditor
+
+  requestCid <- submit buyer do
+    createCmd ContributionRequest with
+      requestId = "REQ-022"
+      contributor = buyer
+      operator
+      auditor
+      transactionId = TransactionId "TX-013"
+      contributionData = sampleContributionData
+      roleInTransaction = Buyer
+      requestDate = now
+      createdAt = now
+
+  contributionCid <- submit operator do
+    exerciseCmd requestCid AcceptNewContribution with
+      contributorData = makeContributorData buyer Buyer
+
+  requestCid2 <- submit seller do
+    createCmd ContributionRequest with
+      requestId = "REQ-023"
+      contributor = seller
+      operator
+      auditor
+      transactionId = TransactionId "TX-013"
+      contributionData = differentContributionData
+      roleInTransaction = Seller
+      requestDate = now
+      createdAt = now
+
+  disputeCid <- submit operator do
+    exerciseCmd requestCid2 OpenDispute with
+      existingContributionCid = contributionCid
+      contributorData = makeContributorData seller Seller
+      tokenMintAuthorityCid
+
+  submitMustFail buyer do
+    exerciseCmd disputeCid Vote with
+      voteForDataIndex = 99  -- Invalid index
+      voter = buyer
+
+  pure ()
+
+testNonContributorCannotVote : Script ()
+testNonContributorCannotVote = do
+  TestParties{..} <- setupParties
+
+  now <- getTime
+
+  tokenMintAuthorityCid <- createTestMintAuthority operator auditor
+
+  requestCid <- submit buyer do
+    createCmd ContributionRequest with
+      requestId = "REQ-024"
+      contributor = buyer
+      operator
+      auditor
+      transactionId = TransactionId "TX-014"
+      contributionData = sampleContributionData
+      roleInTransaction = Buyer
+      requestDate = now
+      createdAt = now
+
+  contributionCid <- submit operator do
+    exerciseCmd requestCid AcceptNewContribution with
+      contributorData = makeContributorData buyer Buyer
+
+  requestCid2 <- submit seller do
+    createCmd ContributionRequest with
+      requestId = "REQ-025"
+      contributor = seller
+      operator
+      auditor
+      transactionId = TransactionId "TX-014"
+      contributionData = differentContributionData
+      roleInTransaction = Seller
+      requestDate = now
+      createdAt = now
+
+  disputeCid <- submit operator do
+    exerciseCmd requestCid2 OpenDispute with
+      existingContributionCid = contributionCid
+      contributorData = makeContributorData seller Seller
+      tokenMintAuthorityCid
+
+  submitMustFail brokerParty do
+    exerciseCmd disputeCid Vote with
+      voteForDataIndex = 0
+      voter = brokerParty
+
+  pure ()
+
+testTrustScoreSingleContributor : Script ()
+testTrustScoreSingleContributor = do
+  TestParties{..} <- setupParties
+
+  now <- getTime
+
+  requestCid <- submit buyer do
+    createCmd ContributionRequest with
+      requestId = "REQ-026"
+      contributor = buyer
+      operator
+      auditor
+      transactionId = TransactionId "TX-015"
+      contributionData = sampleContributionData
+      roleInTransaction = Buyer
+      requestDate = now
+      createdAt = now
+
+  contributionCid <- submit operator do
+    exerciseCmd requestCid AcceptNewContribution with
+      contributorData = makeContributorData buyer Buyer
+
+  contribution <- queryContractId buyer contributionCid
+  let c = fromSome contribution
+  let ts = c.trustScore
+
+  -- one contributor: redundancy bonus is 1 + 0.1 * log2 1 = 1.0
+  assertMsg "Trust score should be positive" (ts.total > 0.0)
+  assertMsg "Buyer score should be positive" (ts.buyer.roleScore > 0.0)
+
+  pure ()
+
+testTrustScoreMultipleContributors : Script ()
+testTrustScoreMultipleContributors = do
+  TestParties{..} <- setupParties
+
+  now <- getTime
+
+  tokenMintAuthorityCid <- createTestMintAuthority operator auditor
+
+  requestCid <- submit buyer do
+    createCmd ContributionRequest with
+      requestId = "REQ-027"
+      contributor = buyer
+      operator
+      auditor
+      transactionId = TransactionId "TX-016"
+      contributionData = sampleContributionData
+      roleInTransaction = Buyer
+      requestDate = now
+      createdAt = now
+
+  singleContribCid <- submit operator do
+    exerciseCmd requestCid AcceptNewContribution with
+      contributorData = makeContributorData buyer Buyer
+
+  singleContrib <- queryContractId buyer singleContribCid
+  let singleScore = (fromSome singleContrib).trustScore.total
+
+  requestCid2 <- submit seller do
+    createCmd ContributionRequest with
+      requestId = "REQ-028"
+      contributor = seller
+      operator
+      auditor
+      transactionId = TransactionId "TX-016"
+      contributionData = sampleContributionData
+      roleInTransaction = Seller
+      requestDate = now
+      createdAt = now
+
+  mergedCid <- submit operator do
+    exerciseCmd requestCid2 MergeContribution with
+      existingContributionCid = singleContribCid
+      contributorData = makeContributorData seller Seller
+      tokenMintAuthorityCid
+
+  mergedContrib <- queryContractId buyer mergedCid
+  let mergedScore = (fromSome mergedContrib).trustScore.total
+
+  assertMsg "Trust score should increase with more contributors" (mergedScore > singleScore)
+
+  pure ()
+
+testTrustScoreDifferentRoles : Script ()
+testTrustScoreDifferentRoles = do
+  TestParties{..} <- setupParties
+
+  now <- getTime
+
+  requestCidBroker <- submit brokerParty do
+    createCmd ContributionRequest with
+      requestId = "REQ-029"
+      contributor = brokerParty
+      operator
+      auditor
+      transactionId = TransactionId "TX-017"
+      contributionData = sampleContributionData
+      roleInTransaction = Broker
+      requestDate = now
+      createdAt = now
+
+  brokerContribCid <- submit operator do
+    exerciseCmd requestCidBroker AcceptNewContribution with
+      contributorData = makeContributorData brokerParty Broker
+
+  brokerContrib <- queryContractId brokerParty brokerContribCid
+  let brokerScore = (fromSome brokerContrib).trustScore.total
+
+  requestCidBuyer <- submit buyer do
+    createCmd ContributionRequest with
+      requestId = "REQ-030"
+      contributor = buyer
+      operator
+      auditor
+      transactionId = TransactionId "TX-018"
+      contributionData = sampleContributionData
+      roleInTransaction = Buyer
+      requestDate = now
+      createdAt = now
+
+  buyerContribCid <- submit operator do
+    exerciseCmd requestCidBuyer AcceptNewContribution with
+      contributorData = makeContributorData buyer Buyer
+
+  buyerContrib <- queryContractId buyer buyerContribCid
+  let buyerScore = (fromSome buyerContrib).trustScore.total
+
+  assertMsg "Broker contribution should have higher trust score" (brokerScore > buyerScore)
+
+  pure ()
+
+testUpdateContributorsData : Script ()
+testUpdateContributorsData = do
+  TestParties{..} <- setupParties
+
+  now <- getTime
+
+  requestCid <- submit buyer do
+    createCmd ContributionRequest with
+      requestId = "REQ-031"
+      contributor = buyer
+      operator
+      auditor
+      transactionId = TransactionId "TX-019"
+      contributionData = sampleContributionData
+      roleInTransaction = Buyer
+      requestDate = now
+      createdAt = now
+
+  contributionCid <- submit operator do
+    exerciseCmd requestCid AcceptNewContribution with
+      contributorData = makeContributorData buyer Buyer
+
+  let updatedContributorData = (makeContributorData buyer Buyer) with reputation = 2.0
+
+  updatedCid <- submit operator do
+    exerciseCmd contributionCid UpdateContributorsData with
+      newContributorsData = [(buyer, updatedContributorData)]
+
+  updated <- queryContractId buyer updatedCid
+  let u = fromSome updated
+  let buyerData = Map.lookup buyer u.contributorsData
+  assertMsg "Buyer data should exist" (buyerData /= None)
+  assertMsg "Reputation should be updated" ((fromSome buyerData).reputation == 2.0)
+
+  pure ()
+
+testContributionRequiresPositiveTrustScore : Script ()
+testContributionRequiresPositiveTrustScore = do
+  TestParties{..} <- setupParties
+
+  now <- getTime
+
+  let zeroRepContributor = (makeContributorData buyer Buyer) with reputation = 0.0
+
+  requestCid <- submit buyer do
+    createCmd ContributionRequest with
+      requestId = "REQ-032"
+      contributor = buyer
+      operator
+      auditor
+      transactionId = TransactionId "TX-020"
+      contributionData = sampleContributionData
+      roleInTransaction = Buyer
+      requestDate = now
+      createdAt = now
+
+  submitMustFail operator do
+    exerciseCmd requestCid AcceptNewContribution with
+      contributorData = zeroRepContributor
+
+  pure ()
+
+testDisputeRequiresReason : Script ()
+testDisputeRequiresReason = do
+  TestParties{..} <- setupParties
+
+  now <- getTime
+
+  tokenMintAuthorityCid <- createTestMintAuthority operator auditor
+
+  -- OpenDispute always sets a reason, so the ensure is exercised by creating the contract directly
+
+  requestCid <- submit buyer do
+    createCmd ContributionRequest with
+      requestId = "REQ-033"
+      contributor = buyer
+      operator
+      auditor
+      transactionId = TransactionId "TX-021"
+      contributionData = sampleContributionData
+      roleInTransaction = Buyer
+      requestDate = now
+      createdAt = now
+
+  contributionCid <- submit operator do
+    exerciseCmd requestCid AcceptNewContribution with
+      contributorData = makeContributorData buyer Buyer
+
+  requestCid2 <- submit seller do
+    createCmd ContributionRequest with
+      requestId = "REQ-034"
+      contributor = seller
+      operator
+      auditor
+      transactionId = TransactionId "TX-021"
+      contributionData = differentContributionData
+      roleInTransaction = Seller
+      requestDate = now
+      createdAt = now
+
+  disputeCid <- submit operator do
+    exerciseCmd requestCid2 OpenDispute with
+      existingContributionCid = contributionCid
+      contributorData = makeContributorData seller Seller
+      tokenMintAuthorityCid
+
+  dispute <- queryContractId buyer disputeCid
+  assertMsg "Dispute reason should not be empty" ((fromSome dispute).reason /= "")
+
+  pure ()
+
+thirdVersionData : ContributionData
+thirdVersionData = ContributionData with
+  propertyAddress = Some Address with
+    postalCode = Some "12345"
+    street = Some "Main Street 1"
+    city = Some "Berlin"
+    country = Some "Germany"
+    additionalInfo = None
+  salePrice = Some 520000.0  -- Different from both sampleContributionData and differentContributionData
+  saleDate = Some (date 1970 Jan 1)  -- script time starts at the epoch, and a sale cannot postdate its report
+  propertyType = Some "Apartment"
+  squareMeters = Some 105.0
+  numberOfRooms = Some 4
+  yearBuilt = Some 2000
+  energyRating = Some B
+  tags = Some ["renovated", "balcony"]
+  additionalInfo = None
+
+testJoinExistentDisputeWithNewData : Script ()
+testJoinExistentDisputeWithNewData = do
+  TestParties{..} <- setupParties
+
+  now <- getTime
+
+  tokenMintAuthorityCid <- createTestMintAuthority operator auditor
+
+  requestCid <- submit buyer do
+    createCmd ContributionRequest with
+      requestId = "REQ-JOIN-001"
+      contributor = buyer
+      operator
+      auditor
+      transactionId = TransactionId "TX-JOIN-001"
+      contributionData = sampleContributionData
+      roleInTransaction = Buyer
+      requestDate = now
+      createdAt = now
+
+  contributionCid <- submit operator do
+    exerciseCmd requestCid AcceptNewContribution with
+      contributorData = makeContributorData buyer Buyer
+
+  requestCid2 <- submit seller do
+    createCmd ContributionRequest with
+      requestId = "REQ-JOIN-002"
+      contributor = seller
+      operator
+      auditor
+      transactionId = TransactionId "TX-JOIN-001"
+      contributionData = differentContributionData
+      roleInTransaction = Seller
+      requestDate = now
+      createdAt = now
+
+  disputeCid <- submit operator do
+    exerciseCmd requestCid2 OpenDispute with
+      existingContributionCid = contributionCid
+      contributorData = makeContributorData seller Seller
+      tokenMintAuthorityCid
+
+  requestCid3 <- submit brokerParty do
+    createCmd ContributionRequest with
+      requestId = "REQ-JOIN-003"
+      contributor = brokerParty
+      operator
+      auditor
+      transactionId = TransactionId "TX-JOIN-001"
+      contributionData = thirdVersionData
+      roleInTransaction = Broker
+      requestDate = now
+      createdAt = now
+
+  updatedDisputeCid <- submit operator do
+    exerciseCmd requestCid3 JoinExistentDispute with
+      existingDisputeCid = disputeCid
+      contributorData = makeContributorData brokerParty Broker
+
+  updatedDispute <- queryContractId buyer updatedDisputeCid
+  let ud = fromSome updatedDispute
+  assertMsg "Should have 3 contributors" (Map.size ud.contributorsData == 3)
+  assertMsg "Should have 3 data versions" (length ud.allData == 3)
+  assertMsg "Broker should be in contributors" (brokerParty `elem` Map.keys ud.contributorsData)
+
+  pure ()
+
+testJoinExistentDisputeWithExistingData : Script ()
+testJoinExistentDisputeWithExistingData = do
+  TestParties{..} <- setupParties
+
+  now <- getTime
+
+  tokenMintAuthorityCid <- createTestMintAuthority operator auditor
+
+  requestCid <- submit buyer do
+    createCmd ContributionRequest with
+      requestId = "REQ-JOIN-004"
+      contributor = buyer
+      operator
+      auditor
+      transactionId = TransactionId "TX-JOIN-002"
+      contributionData = sampleContributionData
+      roleInTransaction = Buyer
+      requestDate = now
+      createdAt = now
+
+  contributionCid <- submit operator do
+    exerciseCmd requestCid AcceptNewContribution with
+      contributorData = makeContributorData buyer Buyer
+
+  requestCid2 <- submit seller do
+    createCmd ContributionRequest with
+      requestId = "REQ-JOIN-005"
+      contributor = seller
+      operator
+      auditor
+      transactionId = TransactionId "TX-JOIN-002"
+      contributionData = differentContributionData
+      roleInTransaction = Seller
+      requestDate = now
+      createdAt = now
+
+  disputeCid <- submit operator do
+    exerciseCmd requestCid2 OpenDispute with
+      existingContributionCid = contributionCid
+      contributorData = makeContributorData seller Seller
+      tokenMintAuthorityCid
+
+  requestCid3 <- submit brokerParty do
+    createCmd ContributionRequest with
+      requestId = "REQ-JOIN-006"
+      contributor = brokerParty
+      operator
+      auditor
+      transactionId = TransactionId "TX-JOIN-002"
+      contributionData = sampleContributionData  -- Same as buyer's data
+      roleInTransaction = Broker
+      requestDate = now
+      createdAt = now
+
+  updatedDisputeCid <- submit operator do
+    exerciseCmd requestCid3 JoinExistentDispute with
+      existingDisputeCid = disputeCid
+      contributorData = makeContributorData brokerParty Broker
+
+  updatedDispute <- queryContractId buyer updatedDisputeCid
+  let ud = fromSome updatedDispute
+  assertMsg "Should have 3 contributors" (Map.size ud.contributorsData == 3)
+  assertMsg "Should still have 2 data versions" (length ud.allData == 2)
+  let brokerVote = Map.lookup brokerParty ud.votes
+  assertMsg "Broker vote should point to existing data (index 0)" (brokerVote == Some 0)
+
+  pure ()
+
+testCannotJoinExistentDisputeDifferentTransaction : Script ()
+testCannotJoinExistentDisputeDifferentTransaction = do
+  TestParties{..} <- setupParties
+
+  now <- getTime
+
+  tokenMintAuthorityCid <- createTestMintAuthority operator auditor
+
+  requestCid <- submit buyer do
+    createCmd ContributionRequest with
+      requestId = "REQ-JOIN-007"
+      contributor = buyer
+      operator
+      auditor
+      transactionId = TransactionId "TX-JOIN-003"
+      contributionData = sampleContributionData
+      roleInTransaction = Buyer
+      requestDate = now
+      createdAt = now
+
+  contributionCid <- submit operator do
+    exerciseCmd requestCid AcceptNewContribution with
+      contributorData = makeContributorData buyer Buyer
+
+  requestCid2 <- submit seller do
+    createCmd ContributionRequest with
+      requestId = "REQ-JOIN-008"
+      contributor = seller
+      operator
+      auditor
+      transactionId = TransactionId "TX-JOIN-003"
+      contributionData = differentContributionData
+      roleInTransaction = Seller
+      requestDate = now
+      createdAt = now
+
+  disputeCid <- submit operator do
+    exerciseCmd requestCid2 OpenDispute with
+      existingContributionCid = contributionCid
+      contributorData = makeContributorData seller Seller
+      tokenMintAuthorityCid
+
+  requestCid3 <- submit brokerParty do
+    createCmd ContributionRequest with
+      requestId = "REQ-JOIN-009"
+      contributor = brokerParty
+      operator
+      auditor
+      transactionId = TransactionId "TX-DIFFERENT"  -- different transaction
+      contributionData = sampleContributionData
+      roleInTransaction = Broker
+      requestDate = now
+      createdAt = now
+
+  submitMustFail operator do
+    exerciseCmd requestCid3 JoinExistentDispute with
+      existingDisputeCid = disputeCid
+      contributorData = makeContributorData brokerParty Broker
+
+  pure ()
+
+testIsActiveNeedsCorroboration : Script ()
+testIsActiveNeedsCorroboration = do
+  TestParties{..} <- setupParties
+
+  now <- getTime
+  tokenMintAuthorityCid <- createTestMintAuthority operator auditor
+
+  requestCid <- submit buyer do
+    createCmd ContributionRequest with
+      requestId = "REQ-ISACTIVE-1"
+      contributor = buyer
+      operator
+      auditor
+      transactionId = TransactionId "TX-ISACTIVE"
+      contributionData = sampleContributionData
+      roleInTransaction = Buyer
+      requestDate = now
+      createdAt = now
+
+  contributionCid <- submit operator do
+    exerciseCmd requestCid AcceptNewContribution with
+      contributorData = makeContributorData buyer Buyer
+
+  aloneIsActive <- submit operator do exerciseCmd contributionCid IsActive
+  assertMsg "one contributor is not corroborated" (not aloneIsActive)
+
+  requestCid2 <- submit seller do
+    createCmd ContributionRequest with
+      requestId = "REQ-ISACTIVE-2"
+      contributor = seller
+      operator
+      auditor
+      transactionId = TransactionId "TX-ISACTIVE"
+      contributionData = sampleContributionData
+      roleInTransaction = Seller
+      requestDate = now
+      createdAt = now
+
+  mergedCid <- submit operator do
+    exerciseCmd requestCid2 MergeContribution with
+      existingContributionCid = contributionCid
+      contributorData = makeContributorData seller Seller
+      tokenMintAuthorityCid
+
+  mergedIsActive <- submit operator do exerciseCmd mergedCid IsActive
+  assertMsg "a second party agreeing makes it active" mergedIsActive
+
+testIsActiveIsNonconsumingAndOperatorOnly : Script ()
+testIsActiveIsNonconsumingAndOperatorOnly = do
+  TestParties{..} <- setupParties
+
+  now <- getTime
+
+  requestCid <- submit buyer do
+    createCmd ContributionRequest with
+      requestId = "REQ-ISACTIVE-3"
+      contributor = buyer
+      operator
+      auditor
+      transactionId = TransactionId "TX-ISACTIVE-2"
+      contributionData = sampleContributionData
+      roleInTransaction = Buyer
+      requestDate = now
+      createdAt = now
+
+  contributionCid <- submit operator do
+    exerciseCmd requestCid AcceptNewContribution with
+      contributorData = makeContributorData buyer Buyer
+
+  _ <- submit operator do exerciseCmd contributionCid IsActive
+  _ <- submit operator do exerciseCmd contributionCid IsActive
+  stillThere <- queryContractId operator contributionCid
+  assertMsg "asking twice leaves the contribution intact" (isSome stillThere)
+
+  submitMustFail buyer do exerciseCmd contributionCid IsActive
+
+-- Internal reputation is never supplied by the operator, at any of the four choices that seat a
+-- party. The fixture passes 1.0, so these tests use a value that is not the initial 0.5.
+testDisputeCoefficientIsEarnedNotSupplied : Script ()
+testDisputeCoefficientIsEarnedNotSupplied = do
+  TestParties{..} <- setupParties
+
+  now <- getTime
+  tokenMintAuthorityCid <- createTestMintAuthority operator auditor
+
+  let inflated party role = (makeContributorData party role) with disputeCoefficient = 9.0
+      coefficientOf party m = (fromSome (Map.lookup party m)).disputeCoefficient
+
+  requestCid <- submit buyer do
+    createCmd ContributionRequest with
+      requestId = "REQ-COEFF-1"
+      contributor = buyer
+      operator
+      auditor
+      transactionId = TransactionId "TX-COEFF"
+      contributionData = sampleContributionData
+      roleInTransaction = Buyer
+      requestDate = now
+      createdAt = now
+
+  contributionCid <- submit operator do
+    exerciseCmd requestCid AcceptNewContribution with
+      contributorData = inflated buyer Buyer
+
+  contribution <- queryContractId buyer contributionCid
+  assertMsg "AcceptNewContribution seats the contributor at the initial value"
+    (coefficientOf buyer (fromSome contribution).contributorsData == _internalReputationInitial_)
+
+  requestCid2 <- submit seller do
+    createCmd ContributionRequest with
+      requestId = "REQ-COEFF-2"
+      contributor = seller
+      operator
+      auditor
+      transactionId = TransactionId "TX-COEFF"
+      contributionData = differentContributionData
+      roleInTransaction = Seller
+      requestDate = now
+      createdAt = now
+
+  disputeCid <- submit operator do
+    exerciseCmd requestCid2 OpenDispute with
+      existingContributionCid = contributionCid
+      contributorData = inflated seller Seller
+      tokenMintAuthorityCid
+
+  dispute <- queryContractId buyer disputeCid
+  assertMsg "OpenDispute seats the disputer at the initial value"
+    (coefficientOf seller (fromSome dispute).contributorsData == _internalReputationInitial_)
+
+  joinedCid <- submit operator do
+    exerciseCmd disputeCid AddDisputer with
+      newContributorData = inflated brokerParty Broker
+      newContributorContributionData = sampleContributionData
+
+  joined <- queryContractId buyer joinedCid
+  assertMsg "AddDisputer seats the joiner at the initial value"
+    (coefficientOf brokerParty (fromSome joined).contributorsData == _internalReputationInitial_)
+
+-- Vote copies originalSubmissionDate onto the recreated Contribution, and the auditor's
+-- point-in-time replay reads it, so OpenDispute must not restamp it.
+testOpenDisputeKeepsTheContributionsOwnDate : Script ()
+testOpenDisputeKeepsTheContributionsOwnDate = do
+  TestParties{..} <- setupParties
+
+  now <- getTime
+  tokenMintAuthorityCid <- createTestMintAuthority operator auditor
+
+  requestCid <- submit buyer do
+    createCmd ContributionRequest with
+      requestId = "REQ-DATE-1"
+      contributor = buyer
+      operator
+      auditor
+      transactionId = TransactionId "TX-DATE"
+      contributionData = sampleContributionData
+      roleInTransaction = Buyer
+      requestDate = now
+      createdAt = now
+
+  contributionCid <- submit operator do
+    exerciseCmd requestCid AcceptNewContribution with
+      contributorData = makeContributorData buyer Buyer
+
+  contribution <- queryContractId buyer contributionCid
+  let submittedAt = (fromSome contribution).originalSubmissionDate
+
+  -- the dispute has to happen at a different instant for the assertion to mean anything
+  passTime (days 30)
+  disputedAt <- getTime
+  assertMsg "the test needs time to have moved" (disputedAt /= submittedAt)
+
+  requestCid2 <- submit seller do
+    createCmd ContributionRequest with
+      requestId = "REQ-DATE-2"
+      contributor = seller
+      operator
+      auditor
+      transactionId = TransactionId "TX-DATE"
+      contributionData = differentContributionData
+      roleInTransaction = Seller
+      requestDate = disputedAt
+      createdAt = disputedAt
+
+  disputeCid <- submit operator do
+    exerciseCmd requestCid2 OpenDispute with
+      existingContributionCid = contributionCid
+      contributorData = makeContributorData seller Seller
+      tokenMintAuthorityCid
+
+  dispute <- queryContractId buyer disputeCid
+  let d = fromSome dispute
+  assertMsg "the dispute carries the contribution's own submission date"
+    (d.originalSubmissionDate == submittedAt)
+  assertMsg "and not the instant the dispute was opened" (d.createdAt == disputedAt)
+
+testContributionRequestRefusesInvalidData : Script ()
+testContributionRequestRefusesInvalidData = do
+  TestParties{..} <- setupParties
+
+  now <- getTime
+
+  let request txId cdata = ContributionRequest with
+        requestId = "REQ-VALID-" <> txId
+        contributor = buyer
+        operator
+        auditor
+        transactionId = TransactionId txId
+        contributionData = cdata
+        roleInTransaction = Buyer
+        requestDate = now
+        createdAt = now
+
+  _ <- submit buyer do createCmd (request "TX-VALID-1" sampleContributionData)
+  _ <- submit buyer do createCmd (request "TX-VALID-2" sampleContributionData with numberOfRooms = Some 0)
+
+  _ <- submit buyer do
+    createCmd (request "TX-VALID-3" sampleContributionData with
+      propertyAddress = None, salePrice = None, squareMeters = None, numberOfRooms = None
+      yearBuilt = None, energyRating = None, tags = None, propertyType = None)
+
+  submitMustFail buyer do createCmd (request "" sampleContributionData)
+  submitMustFail buyer do createCmd (request "TX-BAD-1" sampleContributionData with saleDate = None)
+  submitMustFail buyer do createCmd (request "TX-BAD-2" sampleContributionData with salePrice = Some 0.0)
+  submitMustFail buyer do createCmd (request "TX-BAD-3" sampleContributionData with salePrice = Some (-1.0))
+  submitMustFail buyer do createCmd (request "TX-BAD-4" sampleContributionData with squareMeters = Some 0.0)
+  submitMustFail buyer do createCmd (request "TX-BAD-5" sampleContributionData with numberOfRooms = Some (-1))
+  submitMustFail buyer do createCmd (request "TX-BAD-6" sampleContributionData with yearBuilt = Some 0)
+
+  submitMustFail buyer do
+    createCmd (request "TX-BAD-7" sampleContributionData with saleDate = Some (addDays (toDateUTC now) 1))
+
+  pure ()
+
+testProposeDisputeDataRefusesInvalidData : Script ()
+testProposeDisputeDataRefusesInvalidData = do
+  TestParties{..} <- setupParties
+
+  now <- getTime
+
+  tokenMintAuthorityCid <- createTestMintAuthority operator auditor
+
+  requestCid <- submit buyer do
+    createCmd ContributionRequest with
+      requestId = "REQ-PROP-VALID-1"
+      contributor = buyer
+      operator
+      auditor
+      transactionId = TransactionId "TX-PROP-VALID"
+      contributionData = sampleContributionData
+      roleInTransaction = Buyer
+      requestDate = now
+      createdAt = now
+
+  contributionCid <- submit operator do
+    exerciseCmd requestCid AcceptNewContribution with
+      contributorData = makeContributorData buyer Buyer
+
+  requestCid2 <- submit seller do
+    createCmd ContributionRequest with
+      requestId = "REQ-PROP-VALID-2"
+      contributor = seller
+      operator
+      auditor
+      transactionId = TransactionId "TX-PROP-VALID"
+      contributionData = differentContributionData
+      roleInTransaction = Seller
+      requestDate = now
+      createdAt = now
+
+  disputeCid <- submit operator do
+    exerciseCmd requestCid2 OpenDispute with
+      existingContributionCid = contributionCid
+      contributorData = makeContributorData seller Seller
+      tokenMintAuthorityCid
+
+  submitMustFail buyer do
+    exerciseCmd disputeCid ProposeDisputeData with
+      proposer = buyer
+      newContributionData = sampleContributionData with saleDate = None, salePrice = Some 600000.0
+
+  submitMustFail buyer do
+    exerciseCmd disputeCid ProposeDisputeData with
+      proposer = buyer
+      newContributionData = sampleContributionData with salePrice = Some (-600000.0)
+
+  submitMustFail buyer do
+    exerciseCmd disputeCid ProposeDisputeData with
+      proposer = buyer
+      newContributionData = sampleContributionData with
+        salePrice = Some 600000.0
+        saleDate = Some (addDays (toDateUTC now) 1)
+
+  _ <- submit buyer do
+    exerciseCmd disputeCid ProposeDisputeData with
+      proposer = buyer
+      newContributionData = sampleContributionData with salePrice = Some 600000.0
+
+  pure ()

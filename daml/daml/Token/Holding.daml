@@ -1,0 +1,235 @@
+module Token.Holding where
+
+import Types
+
+import DA.Foldable (mapA_)
+import DA.Optional (fromOptional, isSome, isNone, fromSome)
+import DA.Time (addRelTime, days)
+
+template Holding
+  with
+    owner : Party
+    issuer : Party       -- operator for RewardToken, auditor for AuditToken
+    witness : Party      -- the other one of the two
+    tokenType : TokenType
+    amount : Int
+    locker : Optional Party
+    lockReleaseTime : Optional Time
+    createdAt : Time
+  where
+    signatory issuer, witness, owner
+
+    ensure amount >= 0
+
+    choice Transfer : (ContractId HoldingOffer, ContractId Holding)
+      with
+        recipient : Party
+        transferAmount : Int
+        reference : Optional Text
+      controller owner
+      do
+        assertMsg "Transfer amount must be positive" (transferAmount > 0)
+        assertMsg "Insufficient balance" (amount >= transferAmount)
+
+        assertMsg "Holding is locked" (locker `elem` [None, Some recipient])
+
+        now <- getTime
+
+        recipientHoldingOffer <- create HoldingOffer with
+          from = owner
+          to = recipient
+          issuer
+          witness
+          tokenType
+          amount = transferAmount
+          cancellable = False
+          reference
+          createdAt = now
+
+        senderHolding <- create this with amount = amount - transferAmount, createdAt = now
+
+        pure (recipientHoldingOffer, senderHolding)
+
+    choice TransferAll : ContractId HoldingOffer
+      with
+        recipient : Party
+        reference : Optional Text
+      controller owner
+      do
+        assertMsg "Holding is locked" (locker `elem` [None, Some recipient])
+
+        now <- getTime
+        create HoldingOffer with
+          from = owner
+          to = recipient
+          issuer
+          witness
+          tokenType
+          amount
+          cancellable = False
+          reference
+          createdAt = now
+
+    choice Lock : ContractId Holding
+      with
+        locker : Party
+        releaseTime : Optional Time
+      controller owner
+      do
+        now <- getTime
+        assertMsg "Holding is already locked" (isNone this.locker)
+        assertMsg "Owner can't lock to themselves" (locker /= owner)
+
+        let finalReleaseTime =
+              case releaseTime of
+                Some t -> t
+                None -> addRelTime now (days 1)
+
+        create this with locker = Some locker, lockReleaseTime = Some finalReleaseTime
+
+    choice Unlock : ContractId Holding
+      -- owner is only a placeholder when unlocked, and the guard below then fails anyway
+      controller (fromOptional owner locker)
+      do
+        assertMsg "Holding is not locked" (isSome locker)
+        create this with locker = None, lockReleaseTime = None
+
+    choice RemoveLock : ContractId Holding
+      controller owner
+      do
+        now <- getTime
+        assertMsg "Holding is not locked" (isSome locker)
+        assertMsg "Lock time must have passed" (isSome lockReleaseTime && fromSome lockReleaseTime <= now)
+
+        create this with locker = None, lockReleaseTime = None
+
+    choice Merge : ContractId Holding
+      with
+        otherCids : [ContractId Holding]
+      controller owner
+      do
+        others <- mapA fetch otherCids
+
+        assertMsg "No other holdings to merge" (not (null others))
+        assertMsg "Holding is locked" (isNone locker)
+        assertMsg "Token types must match" (all (\t -> t.tokenType == tokenType) others)
+        assertMsg "Owners must match" (all (\t -> t.owner == owner) others)
+        assertMsg "Issuers must match" (all (\t -> t.issuer == issuer) others)
+        assertMsg "Witnesses must match" (all (\t -> t.witness == witness) others)
+        assertMsg "All holdings must be unlocked" (all (\t -> isNone t.locker) others)
+
+        mapA_ archive otherCids
+
+        now <- getTime
+        create this with amount = foldl (\acc t -> acc + t.amount) amount others, createdAt = now
+
+    choice Split : (ContractId Holding, ContractId Holding)
+      with
+        splitAmount : Int
+      controller owner
+      do
+        assertMsg "Holding is locked" (isNone locker)
+        assertMsg "Split amount must be non-negative" (splitAmount >= 0)
+        assertMsg "Split amount must be less than total" (splitAmount < amount)
+        now <- getTime
+        holding1 <- create this with amount = splitAmount, createdAt = now
+        holding2 <- create this with amount = amount - splitAmount, createdAt = now
+        pure (holding1, holding2)
+
+    choice Delete : ()
+      with
+        actor : Party
+      controller actor
+      do
+        assertMsg "Controller must be owner, issuer, or witness" (actor == owner || actor == issuer || actor == witness)
+        assertMsg "Holding amount must be zero to delete" (amount == 0)
+
+    -- None burns the whole holding
+    choice Burn : Optional (ContractId Holding)
+      with
+        burnAmount : Optional Int
+      controller owner
+      do
+        assertMsg "Holding is locked" (isNone locker)
+
+        let actualBurnAmount = case burnAmount of
+              None -> amount
+              Some amt -> amt
+
+        assertMsg "Burn amount must be positive" (actualBurnAmount > 0)
+        assertMsg "Insufficient balance" (amount >= actualBurnAmount)
+
+        if amount == actualBurnAmount
+        then pure None
+        else do
+          now <- getTime
+          cid <- create this with amount = amount - actualBurnAmount, createdAt = now
+          pure (Some cid)
+
+template HoldingOffer
+  with
+    from : Party
+    to : Party
+    issuer : Party
+    witness : Party
+    tokenType : TokenType
+    amount : Int
+    cancellable : Bool
+    -- A free-form payment reference, e.g. the reward group a payout belongs to. It stays on the
+    -- offer and is not carried onto the Holding, which gets split and merged afterwards.
+    reference : Optional Text
+    createdAt : Time
+  where
+    signatory from, issuer, witness
+    observer to
+
+    ensure amount > 0
+
+    choice AcceptHoldingOffer : ContractId Holding
+      controller to
+      do
+        now <- getTime
+        create Holding with
+          owner = to
+          issuer
+          witness
+          tokenType
+          amount
+          locker = None
+          lockReleaseTime = None
+          createdAt = now
+
+    choice RejectHoldingOffer : ContractId Holding
+      controller to
+      do
+        now <- getTime
+        create Holding with
+          owner = from
+          issuer
+          witness
+          tokenType
+          amount
+          locker = None
+          lockReleaseTime = None
+          createdAt = now
+
+    choice CancelHoldingOffer : ContractId Holding
+      controller from
+      do
+        assertMsg "This offer can't be cancelled" (cancellable)
+        now <- getTime
+        create Holding with
+          owner = from
+          issuer
+          witness
+          tokenType
+          amount
+          locker = None
+          lockReleaseTime = None
+          createdAt = now
+
+tokenToEur : Int -> Decimal
+tokenToEur amount = intToDecimal amount / 1_000_000.0
+
+eurToToken : Decimal -> Int
+eurToToken amount = floor (amount * 1_000_000.0)

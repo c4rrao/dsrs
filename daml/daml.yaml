@@ -1,0 +1,8 @@
+sdk-version: 2.9.3
+name: data-sharing-reward-system
+source: daml
+version: 1.0.0
+dependencies:
+  - daml-prim
+  - daml-stdlib
+  - daml-script

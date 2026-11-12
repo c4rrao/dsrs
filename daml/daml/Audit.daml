@@ -1,0 +1,210 @@
+-- AuditRequest -> AuditProposal -> FundedAuditRequest -> AuditResult
+module Audit where
+
+import Types
+import Token.Holding
+
+import DA.Optional (isNone, isSome)
+
+data AuditRequestType
+  = PricingVerification   -- was the query priced, and answered, correctly
+  | RewardVerification    -- was a reward group paid correctly
+  | InclusionVerification -- was a contribution included in the queries it matched
+  deriving (Eq, Show, Ord)
+
+data AuditRequestParams = AuditRequestParams
+  with
+    queryId : Optional Text          -- pricing, inclusion
+    proposalId : Optional Text       -- pricing
+    rewardGroupId : Optional Text    -- reward
+    transactionId : Optional Text    -- inclusion
+    fromTime : Optional Time         -- inclusion window
+    toTime : Optional Time
+  deriving (Eq, Show)
+
+-- A price can be exactly right on statistics that are wrong, so a pricing check of a completed
+-- query carries the statistics on both sides as well.
+data AuditValue = AuditValue
+  with
+    number : Int                     -- a price, a share, or a count of queries
+    statistics : Optional [Insight]
+  deriving (Eq, Show)
+
+data VerificationResult = VerificationResult
+  with
+    expected : AuditValue  -- derived by the auditor from its own history
+    actual : AuditValue    -- what the operator charged, paid or delivered
+    matches : Bool
+    details : Text
+  deriving (Eq, Show)
+
+template AuditRequest
+  with
+    requestId : Text
+    requester : Party
+    auditor : Party
+    requestType : AuditRequestType
+    params : AuditRequestParams
+    createdAt : Time
+  where
+    signatory requester
+    -- The operator is not a stakeholder anywhere in this workflow. Seeing a request would tell
+    -- it who suspects what, with time to fix the thing about to be checked before the check runs.
+    observer auditor
+
+    choice ProposeAuditPrice : ContractId AuditProposal
+      with
+        estimatedCost : Int
+        description : Text
+      controller auditor
+      do
+        now <- getTime
+        create AuditProposal with
+          requestId
+          requester
+          auditor
+          requestType
+          params
+          estimatedCost
+          description
+          proposedAt = now
+          createdAt = now
+
+    -- Used when the requester has no standing to ask, e.g. about someone else's payout. Only the
+    -- auditor can decide that: the RewardGroup a claim would be checked against is archived when
+    -- it pays out, so no contract is left for a choice to test it against.
+    choice DeclineAuditRequest : ()
+      with
+        reason : Text
+      controller auditor
+      do pure ()
+
+    choice CancelAuditRequest : ()
+      controller requester
+      do pure ()
+
+template AuditProposal
+  with
+    requestId : Text
+    requester : Party
+    auditor : Party
+    requestType : AuditRequestType
+    params : AuditRequestParams
+    estimatedCost : Int
+    description : Text
+    proposedAt : Time
+    createdAt : Time
+  where
+    signatory auditor
+    observer requester
+
+    choice FundAudit : ContractId FundedAuditRequest
+      with
+        auditTokenHoldingCid : ContractId Holding
+      controller requester
+      do
+        holding <- fetch auditTokenHoldingCid
+        assertMsg "Must be audit tokens" (holding.tokenType == AuditToken)
+        assertMsg "Insufficient tokens" (holding.amount >= estimatedCost)
+
+        now <- getTime
+
+        -- split off only the cost, so the rest of the balance stays usable
+        paymentHoldingCid <-
+          if holding.amount == estimatedCost
+          then pure auditTokenHoldingCid
+          else do
+            (h1, _remainderCid) <- exercise auditTokenHoldingCid Split with splitAmount = estimatedCost
+            pure h1
+
+        lockedCid <- exercise paymentHoldingCid Lock with
+          locker = auditor
+          releaseTime = None
+
+        create FundedAuditRequest with
+          requestId
+          requester
+          auditor
+          requestType
+          params
+          holdingCid = lockedCid
+          tokenAmount = estimatedCost
+          fundedAt = now
+          createdAt = now
+
+    choice RejectAuditProposal : ()
+      controller requester
+      do pure ()
+
+    choice WithdrawAuditProposal : ()
+      controller auditor
+      do pure ()
+
+template FundedAuditRequest
+  with
+    requestId : Text
+    requester : Party
+    auditor : Party
+    requestType : AuditRequestType
+    params : AuditRequestParams
+    holdingCid : ContractId Holding
+    tokenAmount : Int
+    fundedAt : Time
+    createdAt : Time
+  where
+    signatory requester, auditor
+
+    choice CompleteAudit : ContractId AuditResult
+      with
+        result : VerificationResult
+      controller auditor
+      do
+        -- Storing expected and actual lets anyone recompute the verdict, which only means something
+        -- if the stored verdict agrees with them.
+        assertMsg "only a pricing verification carries statistics"
+          (requestType == PricingVerification
+            || (isNone result.expected.statistics && isNone result.actual.statistics))
+        assertMsg "statistics are stored on both sides or on neither"
+          (isSome result.expected.statistics == isSome result.actual.statistics)
+        assertMsg "matches must be consistent with expected/actual"
+          (result.matches == (result.expected == result.actual))
+
+        unlockedCid <- exercise holdingCid Unlock
+        _ <- exercise unlockedCid Burn with burnAmount = Some tokenAmount
+
+        now <- getTime
+        create AuditResult with
+          requestId
+          requester
+          auditor
+          verificationType = requestType
+          result
+          tokensBurned = tokenAmount
+          completedAt = now
+          createdAt = now
+
+    choice RefundAudit : ContractId Holding
+      with
+        reason : Text
+      controller auditor
+      do
+        assertMsg "Reason required" (reason /= "")
+        unlockedCid <- exercise holdingCid Unlock
+        offerCid <- exercise unlockedCid TransferAll with
+                      recipient = requester
+                      reference = Some ("audit_refund: " <> requestId)
+        exercise offerCid AcceptHoldingOffer
+
+template AuditResult
+  with
+    requestId : Text
+    requester : Party
+    auditor : Party
+    verificationType : AuditRequestType
+    result : VerificationResult
+    tokensBurned : Int
+    completedAt : Time
+    createdAt : Time
+  where
+    signatory auditor
+    observer requester

@@ -1,0 +1,645 @@
+module Test.HoldingTest where
+
+import Daml.Script
+import DA.Time (days, addRelTime)
+import DA.Optional (fromSome)
+
+import Types
+import Token.Holding
+
+data TestParties = TestParties with
+  operator : Party   -- Acts as issuer for RewardToken
+  auditor : Party    -- Acts as witness for RewardToken
+  alice : Party
+  bob : Party
+  charlie : Party
+
+setupParties : Script TestParties
+setupParties = do
+  operator <- allocateParty "Operator"
+  auditor <- allocateParty "Auditor"
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  charlie <- allocateParty "Charlie"
+  pure TestParties{..}
+
+createHolding : Party -> Party -> Party -> Int -> Script (ContractId Holding)
+createHolding issuer witness owner amount = do
+  now <- getTime
+  submitMulti [issuer, witness, owner] [] do
+    createCmd Holding with
+      owner
+      issuer
+      witness
+      tokenType = RewardToken
+      amount
+      locker = None
+      lockReleaseTime = None
+      createdAt = now
+
+testCreateHolding : Script ()
+testCreateHolding = do
+  TestParties{..} <- setupParties
+
+  holdingCid <- createHolding operator auditor alice 1000
+
+  holding <- queryContractId alice holdingCid
+  assertMsg "Holding should exist" ((fromSome holding).amount == 1000)
+  pure ()
+
+testHoldingEnsureNonNegativeAmount : Script ()
+testHoldingEnsureNonNegativeAmount = do
+  TestParties{..} <- setupParties
+  now <- getTime
+
+  submitMultiMustFail [operator, auditor, alice] [] do
+    createCmd Holding with
+      owner = alice
+      issuer = operator
+      witness = auditor
+      tokenType = RewardToken
+      amount = -100
+      locker = None
+      lockReleaseTime = None
+      createdAt = now
+
+  pure ()
+
+testHoldingZeroAmount : Script ()
+testHoldingZeroAmount = do
+  TestParties{..} <- setupParties
+  now <- getTime
+
+  holdingCid <- submitMulti [operator, auditor, alice] [] do
+    createCmd Holding with
+      owner = alice
+      issuer = operator
+      witness = auditor
+      tokenType = RewardToken
+      amount = 0
+      locker = None
+      lockReleaseTime = None
+      createdAt = now
+
+  holding <- queryContractId alice holdingCid
+  assertMsg "Zero amount holding should exist" ((fromSome holding).amount == 0)
+  pure ()
+
+testPartialTransfer : Script ()
+testPartialTransfer = do
+  TestParties{..} <- setupParties
+
+  holdingCid <- createHolding operator auditor alice 1000
+
+  (offerCid, remainingCid) <- submit alice do
+    exerciseCmd holdingCid Transfer with
+      recipient = bob
+      transferAmount = 300
+      reference = None
+
+  bobHoldingCid <- submit bob do
+    exerciseCmd offerCid AcceptHoldingOffer
+
+  aliceHolding <- queryContractId alice remainingCid
+  bobHolding <- queryContractId bob bobHoldingCid
+
+  assertMsg "Alice should have 700 tokens" ((fromSome aliceHolding).amount == 700)
+  assertMsg "Bob should have 300 tokens" ((fromSome bobHolding).amount == 300)
+
+  pure ()
+
+testTransferAll : Script ()
+testTransferAll = do
+  TestParties{..} <- setupParties
+
+  holdingCid <- createHolding operator auditor alice 1000
+
+  offerCid <- submit alice do
+    exerciseCmd holdingCid TransferAll with recipient = bob; reference = None
+
+  bobHoldingCid <- submit bob do
+    exerciseCmd offerCid AcceptHoldingOffer
+
+  bobHolding <- queryContractId bob bobHoldingCid
+  assertMsg "Bob should have 1000 tokens" ((fromSome bobHolding).amount == 1000)
+
+  aliceHolding <- queryContractId alice holdingCid
+  assertMsg "Alice's original holding should be archived" (aliceHolding == None)
+
+  pure ()
+
+testTransferInsufficientBalance : Script ()
+testTransferInsufficientBalance = do
+  TestParties{..} <- setupParties
+
+  holdingCid <- createHolding operator auditor alice 100
+
+  submitMustFail alice do
+    exerciseCmd holdingCid Transfer with
+      recipient = bob
+      transferAmount = 200
+      reference = None
+
+  pure ()
+
+testTransferZeroAmount : Script ()
+testTransferZeroAmount = do
+  TestParties{..} <- setupParties
+
+  holdingCid <- createHolding operator auditor alice 100
+
+  submitMustFail alice do
+    exerciseCmd holdingCid Transfer with
+      recipient = bob
+      transferAmount = 0
+      reference = None
+
+  pure ()
+
+testTransferNegativeAmount : Script ()
+testTransferNegativeAmount = do
+  TestParties{..} <- setupParties
+
+  holdingCid <- createHolding operator auditor alice 100
+
+  submitMustFail alice do
+    exerciseCmd holdingCid Transfer with
+      recipient = bob
+      transferAmount = -50
+      reference = None
+
+  pure ()
+
+testLockUnlock : Script ()
+testLockUnlock = do
+  TestParties{..} <- setupParties
+
+  holdingCid <- createHolding operator auditor alice 1000
+
+  lockedCid <- submit alice do
+    exerciseCmd holdingCid Lock with
+      locker = operator
+      releaseTime = None
+
+  locked <- queryContractId alice lockedCid
+  assertMsg "Holding should be locked for operator" ((fromSome locked).locker == Some operator)
+
+  unlockedCid <- submit operator do
+    exerciseCmd lockedCid Unlock
+
+  unlocked <- queryContractId alice unlockedCid
+  assertMsg "Holding should be unlocked" ((fromSome unlocked).locker == None)
+
+  pure ()
+
+testOwnerCannotLockToSelf : Script ()
+testOwnerCannotLockToSelf = do
+  TestParties{..} <- setupParties
+
+  holdingCid <- createHolding operator auditor alice 1000
+
+  submitMustFail alice do
+    exerciseCmd holdingCid Lock with
+      locker = alice
+      releaseTime = None
+
+  pure ()
+
+testDoubleLock : Script ()
+testDoubleLock = do
+  TestParties{..} <- setupParties
+
+  holdingCid <- createHolding operator auditor alice 1000
+
+  lockedCid <- submit alice do
+    exerciseCmd holdingCid Lock with
+      locker = operator
+      releaseTime = None
+
+  submitMustFail alice do
+    exerciseCmd lockedCid Lock with
+      locker = bob
+      releaseTime = None
+
+  pure ()
+
+testLockedTransferRestriction : Script ()
+testLockedTransferRestriction = do
+  TestParties{..} <- setupParties
+
+  holdingCid <- createHolding operator auditor alice 1000
+
+  lockedCid <- submit alice do
+    exerciseCmd holdingCid Lock with
+      locker = operator
+      releaseTime = None
+
+  submitMustFail alice do
+    exerciseCmd lockedCid TransferAll with recipient = bob; reference = None
+
+  pure ()
+
+testLockedTransferToLocker : Script ()
+testLockedTransferToLocker = do
+  TestParties{..} <- setupParties
+
+  holdingCid <- createHolding operator auditor alice 1000
+
+  lockedCid <- submit alice do
+    exerciseCmd holdingCid Lock with
+      locker = bob
+      releaseTime = None
+
+  offerCid <- submit alice do
+    exerciseCmd lockedCid TransferAll with recipient = bob; reference = None
+
+  bobHoldingCid <- submit bob do
+    exerciseCmd offerCid AcceptHoldingOffer
+
+  bobHolding <- queryContractId bob bobHoldingCid
+  assertMsg "Bob should have the tokens" ((fromSome bobHolding).amount == 1000)
+
+  pure ()
+
+testRemoveLockAfterReleaseTime : Script ()
+testRemoveLockAfterReleaseTime = do
+  TestParties{..} <- setupParties
+
+  holdingCid <- createHolding operator auditor alice 1000
+
+  now <- getTime
+  let releaseTime = addRelTime now (days 1)
+
+  lockedCid <- submit alice do
+    exerciseCmd holdingCid Lock with
+      locker = operator
+      releaseTime = Some releaseTime
+
+  submitMustFail alice do
+    exerciseCmd lockedCid RemoveLock
+
+  setTime (addRelTime releaseTime (days 1))
+
+  unlockedCid <- submit alice do
+    exerciseCmd lockedCid RemoveLock
+
+  unlocked <- queryContractId alice unlockedCid
+  assertMsg "Holding should be unlocked" ((fromSome unlocked).locker == None)
+
+  pure ()
+
+testMergeHoldings : Script ()
+testMergeHoldings = do
+  TestParties{..} <- setupParties
+
+  h1 <- createHolding operator auditor alice 100
+  h2 <- createHolding operator auditor alice 200
+  h3 <- createHolding operator auditor alice 300
+
+  mergedCid <- submit alice do
+    exerciseCmd h1 Merge with otherCids = [h2, h3]
+
+  merged <- queryContractId alice mergedCid
+  assertMsg "Merged holding should have 600 tokens" ((fromSome merged).amount == 600)
+
+  h2' <- queryContractId alice h2
+  h3' <- queryContractId alice h3
+  assertMsg "h2 should be archived" (h2' == None)
+  assertMsg "h3 should be archived" (h3' == None)
+
+  pure ()
+
+testMergeEmptyList : Script ()
+testMergeEmptyList = do
+  TestParties{..} <- setupParties
+
+  holdingCid <- createHolding operator auditor alice 100
+
+  submitMustFail alice do
+    exerciseCmd holdingCid Merge with otherCids = []
+
+  pure ()
+
+testMergeSameTokenTypes : Script ()
+testMergeSameTokenTypes = do
+  TestParties{..} <- setupParties
+
+  -- RewardToken is the only type a test holding is created with
+  h1 <- createHolding operator auditor alice 100
+  h2 <- createHolding operator auditor alice 200
+
+  mergedCid <- submit alice do
+    exerciseCmd h1 Merge with otherCids = [h2]
+
+  merged <- queryContractId alice mergedCid
+  assertMsg "Merged holding should have 300 tokens" ((fromSome merged).amount == 300)
+
+  pure ()
+
+testMergeDifferentOwners : Script ()
+testMergeDifferentOwners = do
+  TestParties{..} <- setupParties
+
+  aliceHolding <- createHolding operator auditor alice 100
+  bobHolding <- createHolding operator auditor bob 200
+
+  submitMustFail alice do
+    exerciseCmd aliceHolding Merge with otherCids = [bobHolding]
+
+  pure ()
+
+testMergeLockedHolding : Script ()
+testMergeLockedHolding = do
+  TestParties{..} <- setupParties
+
+  h1 <- createHolding operator auditor alice 100
+  h2 <- createHolding operator auditor alice 200
+
+  lockedH2 <- submit alice do
+    exerciseCmd h2 Lock with locker = operator; releaseTime = None
+
+  submitMustFail alice do
+    exerciseCmd h1 Merge with otherCids = [lockedH2]
+
+  pure ()
+
+testSplitHolding : Script ()
+testSplitHolding = do
+  TestParties{..} <- setupParties
+
+  holdingCid <- createHolding operator auditor alice 1000
+
+  (h1, h2) <- submit alice do
+    exerciseCmd holdingCid Split with splitAmount = 400
+
+  holding1 <- queryContractId alice h1
+  holding2 <- queryContractId alice h2
+
+  assertMsg "First holding should have 400 tokens" ((fromSome holding1).amount == 400)
+  assertMsg "Second holding should have 600 tokens" ((fromSome holding2).amount == 600)
+
+  pure ()
+
+testSplitExceedsTotal : Script ()
+testSplitExceedsTotal = do
+  TestParties{..} <- setupParties
+
+  holdingCid <- createHolding operator auditor alice 100
+
+  submitMustFail alice do
+    exerciseCmd holdingCid Split with splitAmount = 100
+
+  submitMustFail alice do
+    exerciseCmd holdingCid Split with splitAmount = 150
+
+  pure ()
+
+testSplitNegativeAmount : Script ()
+testSplitNegativeAmount = do
+  TestParties{..} <- setupParties
+
+  holdingCid <- createHolding operator auditor alice 100
+
+  submitMustFail alice do
+    exerciseCmd holdingCid Split with splitAmount = -50
+
+  pure ()
+
+testSplitLockedHolding : Script ()
+testSplitLockedHolding = do
+  TestParties{..} <- setupParties
+
+  holdingCid <- createHolding operator auditor alice 100
+
+  lockedCid <- submit alice do
+    exerciseCmd holdingCid Lock with locker = operator; releaseTime = None
+
+  submitMustFail alice do
+    exerciseCmd lockedCid Split with splitAmount = 50
+
+  pure ()
+
+testDeleteZeroHolding : Script ()
+testDeleteZeroHolding = do
+  TestParties{..} <- setupParties
+  now <- getTime
+
+  holdingCid <- submitMulti [operator, auditor, alice] [] do
+    createCmd Holding with
+      owner = alice
+      issuer = operator
+      witness = auditor
+      tokenType = RewardToken
+      amount = 0
+      locker = None
+      lockReleaseTime = None
+      createdAt = now
+
+  submit alice do
+    exerciseCmd holdingCid Delete with actor = alice
+
+  holding <- queryContractId alice holdingCid
+  assertMsg "Holding should be deleted" (holding == None)
+
+  pure ()
+
+testIssuerDeleteZeroHolding : Script ()
+testIssuerDeleteZeroHolding = do
+  TestParties{..} <- setupParties
+  now <- getTime
+
+  holdingCid <- submitMulti [operator, auditor, alice] [] do
+    createCmd Holding with
+      owner = alice
+      issuer = operator
+      witness = auditor
+      tokenType = RewardToken
+      amount = 0
+      locker = None
+      lockReleaseTime = None
+      createdAt = now
+
+  submit operator do
+    exerciseCmd holdingCid Delete with actor = operator
+
+  pure ()
+
+testDeleteNonZeroHolding : Script ()
+testDeleteNonZeroHolding = do
+  TestParties{..} <- setupParties
+
+  holdingCid <- createHolding operator auditor alice 100
+
+  submitMustFail alice do
+    exerciseCmd holdingCid Delete with actor = alice
+
+  pure ()
+
+testUnauthorizedDelete : Script ()
+testUnauthorizedDelete = do
+  TestParties{..} <- setupParties
+  now <- getTime
+
+  holdingCid <- submitMulti [operator, auditor, alice] [] do
+    createCmd Holding with
+      owner = alice
+      issuer = operator
+      witness = auditor
+      tokenType = RewardToken
+      amount = 0
+      locker = None
+      lockReleaseTime = None
+      createdAt = now
+
+  submitMustFail bob do
+    exerciseCmd holdingCid Delete with actor = bob
+
+  pure ()
+
+testBurnComplete : Script ()
+testBurnComplete = do
+  TestParties{..} <- setupParties
+
+  holdingCid <- createHolding operator auditor alice 100
+
+  result <- submit alice do
+    exerciseCmd holdingCid Burn with burnAmount = Some 100
+
+  assertMsg "Complete burn should return None" (result == None)
+
+  pure ()
+
+testBurnPartial : Script ()
+testBurnPartial = do
+  TestParties{..} <- setupParties
+
+  holdingCid <- createHolding operator auditor alice 100
+
+  result <- submit alice do
+    exerciseCmd holdingCid Burn with burnAmount = Some 40
+
+  case result of
+    None -> assertMsg "Partial burn should return remaining holding" False
+    Some remainingCid -> do
+      remaining <- queryContractId alice remainingCid
+      assertMsg "Remaining should have 60 tokens" ((fromSome remaining).amount == 60)
+
+  pure ()
+
+testBurnEntireWithNone : Script ()
+testBurnEntireWithNone = do
+  TestParties{..} <- setupParties
+
+  holdingCid <- createHolding operator auditor alice 100
+
+  result <- submit alice do
+    exerciseCmd holdingCid Burn with burnAmount = None
+
+  assertMsg "Burning with None should return None" (result == None)
+
+  pure ()
+
+testBurnInsufficientBalance : Script ()
+testBurnInsufficientBalance = do
+  TestParties{..} <- setupParties
+
+  holdingCid <- createHolding operator auditor alice 100
+
+  submitMustFail alice do
+    exerciseCmd holdingCid Burn with burnAmount = Some 150
+
+  pure ()
+
+testBurnLockedHolding : Script ()
+testBurnLockedHolding = do
+  TestParties{..} <- setupParties
+
+  holdingCid <- createHolding operator auditor alice 100
+
+  lockedCid <- submit alice do
+    exerciseCmd holdingCid Lock with locker = operator; releaseTime = None
+
+  submitMustFail alice do
+    exerciseCmd lockedCid Burn with burnAmount = Some 50
+
+  pure ()
+
+testRejectHoldingOffer : Script ()
+testRejectHoldingOffer = do
+  TestParties{..} <- setupParties
+
+  holdingCid <- createHolding operator auditor alice 1000
+
+  offerCid <- submit alice do
+    exerciseCmd holdingCid TransferAll with recipient = bob; reference = None
+
+  returnedCid <- submit bob do
+    exerciseCmd offerCid RejectHoldingOffer
+
+  returned <- queryContractId alice returnedCid
+  assertMsg "Tokens should return to Alice" ((fromSome returned).owner == alice)
+  assertMsg "Amount should be preserved" ((fromSome returned).amount == 1000)
+
+  pure ()
+
+testCancelHoldingOffer : Script ()
+testCancelHoldingOffer = do
+  TestParties{..} <- setupParties
+  now <- getTime
+
+  offerCid <- submitMulti [alice, operator, auditor] [] do
+    createCmd HoldingOffer with
+      from = alice
+      to = bob
+      issuer = operator
+      witness = auditor
+      tokenType = RewardToken
+      amount = 500
+      cancellable = True
+      reference = None
+      createdAt = now
+
+  returnedCid <- submit alice do
+    exerciseCmd offerCid CancelHoldingOffer
+
+  returned <- queryContractId alice returnedCid
+  assertMsg "Tokens should return to Alice" ((fromSome returned).owner == alice)
+
+  pure ()
+
+testCancelNonCancellableOffer : Script ()
+testCancelNonCancellableOffer = do
+  TestParties{..} <- setupParties
+
+  holdingCid <- createHolding operator auditor alice 1000
+
+  (offerCid, _) <- submit alice do
+    exerciseCmd holdingCid Transfer with
+      recipient = bob
+      transferAmount = 500
+      reference = None
+
+  submitMustFail alice do
+    exerciseCmd offerCid CancelHoldingOffer
+
+  pure ()
+
+testEurToToken : Script ()
+testEurToToken = do
+  let tokens = eurToToken 1.0
+  assertMsg "1 EUR should be 1,000,000 tokens" (tokens == 1_000_000)
+
+  let tokens2 = eurToToken 10.5
+  assertMsg "10.5 EUR should be 10,500,000 tokens" (tokens2 == 10_500_000)
+
+  pure ()
+
+testTokenToEur : Script ()
+testTokenToEur = do
+  let eur = tokenToEur 1_000_000
+  assertMsg "1,000,000 tokens should be 1 EUR" (eur == 1.0)
+
+  let eur2 = tokenToEur 500_000
+  assertMsg "500,000 tokens should be 0.5 EUR" (eur2 == 0.5)
+
+  pure ()

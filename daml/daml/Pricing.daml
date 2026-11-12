@@ -1,0 +1,137 @@
+module Pricing where
+
+import DA.Math (logBase, (**), exp)
+
+import Token.Holding (eurToToken)
+
+template PricingConfig
+  with
+    operator : Party
+    auditor : Party
+    public : Party                       -- lets consumers see the configuration
+    basePrice : Int
+    level1Multiplier : Decimal
+    level2Multiplier : Decimal
+    coverageWeight : Decimal             -- max premium for holding the whole corpus (2.0 = up to 3x)
+    coverageSaturation : Decimal         -- how fast completeness stops paying (5.0: 20% coverage earns 63% of it)
+    narrownessWeight : Decimal           -- max premium per fully narrowed dimension (0.5 = up to 1.5x)
+    trustWeight : Decimal                -- quality multiplier at the top of the trust scale, its reciprocal at the bottom
+    createdAt : Time
+  where
+    signatory operator
+    observer auditor, public
+
+    choice UpdateConfig : ContractId PricingConfig
+      with
+        newBasePrice : Int
+        newLevel1Multiplier : Decimal
+        newLevel2Multiplier : Decimal
+        newCoverageWeight : Decimal
+        newCoverageSaturation : Decimal
+        newNarrownessWeight : Decimal
+        newTrustWeight : Decimal
+      controller operator
+      do
+        assertMsg "Base price must be positive" (newBasePrice > 0)
+        assertMsg "Level multipliers must be positive" (newLevel1Multiplier > 0.0 && newLevel2Multiplier > 0.0)
+        -- coverageWeight = 0 or trustWeight = 1 would silently switch a whole term of the price off.
+        assertMsg "Coverage weight must be positive" (newCoverageWeight > 0.0)
+        assertMsg "Coverage saturation must be positive" (newCoverageSaturation > 0.0)
+        assertMsg "Narrowness weight must be >= 0" (newNarrownessWeight >= 0.0)
+        assertMsg "Trust weight must be greater than 1" (newTrustWeight > 1.0)
+
+        now <- getTime
+        create this with
+          basePrice = newBasePrice
+          level1Multiplier = newLevel1Multiplier
+          level2Multiplier = newLevel2Multiplier
+          coverageWeight = newCoverageWeight
+          coverageSaturation = newCoverageSaturation
+          narrownessWeight = newNarrownessWeight
+          trustWeight = newTrustWeight
+          createdAt = now
+
+    --   price = base
+    --         × log₂(1 + n) × (1 + coverageWeight × (1 − e^(−λ·n/N)))     volume
+    --         × levelMultiplier                                            depth
+    --         × ∏ (1 + narrownessWeight × s²)                              precision
+    --         × trustWeight ^ q                                            quality
+    --
+    -- Every term is exactly 1.0 when its dimension is unfiltered, so "give me everything"
+    -- reduces to base × log₂(1+n) × (1 + coverageWeight) × levelMultiplier.
+    --
+    -- The logarithm makes each extra transaction worth less. Coverage tells a thousand rows out of
+    -- two thousand apart from a thousand out of a million, and saturates. The square makes
+    -- narrowness accelerate, bounded since the privacy floor already refuses the narrowest
+    -- queries. Trust is an exponent so that it can price below the corpus average too.
+    nonconsuming choice CalculatePrice : Int
+      with
+        numTransactions : Int
+        corpusTransactions : Int
+        level : Int
+        addressSelectivity : Decimal
+        salePriceSelectivity : Decimal
+        saleDateSelectivity : Decimal
+        squareMetersSelectivity : Decimal
+        yearBuiltSelectivity : Decimal
+        roomsSelectivity : Decimal
+        propertyTypeSelectivity : Decimal
+        energyRatingSelectivity : Decimal
+        tagsSelectivity : Decimal
+        trustQuality : Decimal
+      controller operator
+      do
+        assertMsg "Corpus must be at least as large as the matched set"
+          (corpusTransactions >= numTransactions)
+
+        let price0 = intToDecimal basePrice
+
+        let n = intToDecimal numTransactions
+            bigN = intToDecimal corpusTransactions
+            coverage = if corpusTransactions <= 0 then 0.0 else n / bigN
+            completeness = 1.0 - exp (- coverageSaturation * coverage)
+            volumeFactor = log2 (1.0 + n) * (1.0 + coverageWeight * completeness)
+            price1 = price0 * volumeFactor
+
+        let levelMult = if level == 1 then level1Multiplier else level2Multiplier
+            price2 = price1 * levelMult
+
+        let narrow s =
+              let sc = min 1.0 (max 0.0 s)
+              in 1.0 + narrownessWeight * sc * sc
+            precisionFactor =
+              narrow addressSelectivity
+                * narrow salePriceSelectivity
+                * narrow saleDateSelectivity
+                * narrow squareMetersSelectivity
+                * narrow yearBuiltSelectivity
+                * narrow roomsSelectivity
+                * narrow propertyTypeSelectivity
+                * narrow energyRatingSelectivity
+                * narrow tagsSelectivity
+            price3 = price2 * precisionFactor
+
+        -- neutral at the corpus average, a discount below it
+        let q = min 1.0 (max (-1.0) trustQuality)
+            qualityFactor = trustWeight ** q
+            price4 = price3 * qualityFactor
+
+        let finalPrice = floor price4
+        pure (if finalPrice < 1 then 1 else finalPrice)
+
+log2 : Decimal -> Decimal
+log2 x = logBase 2.0 x
+
+defaultPricingConfig : Party -> Party -> Party -> Time -> PricingConfig
+defaultPricingConfig operator auditor public createdAt = PricingConfig with
+  operator
+  auditor
+  public
+  basePrice = eurToToken 10.0
+  level1Multiplier = 1.0
+  level2Multiplier = 3.0
+  coverageWeight = 2.0
+  coverageSaturation = 5.0
+  narrownessWeight = 0.5
+  trustWeight = 4.0
+  createdAt

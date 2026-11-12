@@ -1,0 +1,464 @@
+module Contribution where
+
+import Types
+import Constants
+import Token.Mint
+
+import DA.Map as Map
+import DA.List as List
+import DA.Math (logBase)
+import DA.Date (toDateUTC)
+
+data ContributorData = ContributorData
+  with
+    contributor : Party
+    roleInTransaction : Role
+    -- internal reputation in [0,1], moved only by dispute outcomes
+    disputeCoefficient : Decimal
+    -- external reputation; no external source is wired in, so it stays at its initial value
+    reputation : Decimal
+  deriving (Eq, Show, Ord)
+
+data RoleScore = RoleScore
+  with
+    roleScore : Decimal
+    sumIndividualScores : Decimal
+    contributorScores : [(Party, Decimal)]
+  deriving (Eq, Show, Ord)
+
+data TrustScoreTree = TrustScoreTree
+  with
+    total : Decimal
+    buyer : RoleScore
+    seller : RoleScore
+    broker : RoleScore
+    notary : RoleScore
+    taxAuthority : RoleScore
+  deriving (Eq, Show, Ord)
+
+template Contribution
+  with
+    contributionId : Text
+    contributorsData : Map Party ContributorData
+    operator : Party
+    auditor : Party
+    transactionId : TransactionId
+    contributionData : ContributionData
+    trustScore : TrustScoreTree
+    originalSubmissionDate : Time
+    disputeDates : [Time]
+    createdAt : Time
+  where
+    signatory operator
+    -- contributors' consent is the ContributionRequest they signed
+    observer auditor :: (Map.keys contributorsData)
+
+    ensure trustScore.total > 0.0
+
+    nonconsuming choice IsActive : Bool
+      controller operator
+      do
+        pure (Map.size contributorsData > 1)
+
+    choice UpdateContributorsData : ContractId Contribution
+      with
+        newContributorsData : [(Party, ContributorData)]
+      controller operator
+      do
+        let updatedContributorsData = foldl (\acc (party, cdata) -> Map.insert party cdata acc) contributorsData newContributorsData
+
+        now <- getTime
+        create this with
+          contributorsData = updatedContributorsData
+          trustScore = computeTrustScoreTree (Map.values updatedContributorsData)
+          createdAt = now
+
+template ContributionRequest
+  with
+    requestId : Text
+    contributor : Party
+    operator : Party
+    auditor : Party
+    transactionId : TransactionId
+    contributionData : ContributionData
+    roleInTransaction : Role  -- signed by the contributor, since it drives their reward share
+    requestDate : Time
+    createdAt : Time
+  where
+    signatory contributor
+    observer operator, auditor
+
+    -- Validated where the contributor signs, so none of the operator's four choices below has to
+    -- repeat it.
+    ensure unpackTransactionId transactionId /= ""
+      && contributionDataIsValid contributionData
+      && saleDateNotAfter (toDateUTC requestDate) contributionData
+
+    choice AcceptNewContribution : ContractId Contribution
+      with
+        contributorData: ContributorData
+      controller operator
+      do
+        now <- getTime
+
+        -- Internal reputation is only earned through disputes, never supplied by the caller.
+        let neutralContributorData = contributorData with disputeCoefficient = _internalReputationInitial_
+
+        create Contribution with
+          -- the transaction id identifies one real sale, so it is already unique
+          contributionId = "CONT-" <> unpackTransactionId transactionId
+          contributorsData = Map.fromList [(neutralContributorData.contributor, neutralContributorData)]
+          operator
+          auditor
+          transactionId
+          contributionData
+          trustScore = computeTrustScoreTree [neutralContributorData]
+          originalSubmissionDate = now
+          disputeDates = []
+          createdAt = now
+
+    -- Corroboration. Every contributor on the record receives the corroboration bonus.
+    choice MergeContribution : ContractId Contribution
+      with
+        existingContributionCid : ContractId Contribution
+        contributorData : ContributorData
+        tokenMintAuthorityCid : ContractId TokenMintAuthority
+      controller operator
+      do
+        existingContribution <- fetch existingContributionCid
+        assertMsg "Contributions must be about the same transaction" (existingContribution.transactionId == transactionId)
+        assertMsg "Contributor must be different" (contributorData.contributor `notElem` (Map.keys existingContribution.contributorsData))
+        assertMsg "The contribution data don't match" (existingContribution.contributionData == contributionData)
+
+        let mergedContributors = Map.insert
+              contributorData.contributor
+              (contributorData with disputeCoefficient = _internalReputationInitial_)
+              existingContribution.contributorsData
+
+        archive existingContributionCid
+
+        now <- getTime
+
+        let allContributors = Map.keys mergedContributors
+            recipients = map (\p -> (p, _auditTokenCorroborationBonus_)) allContributors
+
+        mintForEvent MintForEvent with
+          operator
+          auditor
+          authorityCid = tokenMintAuthorityCid
+          entitlementId = "MINT-CORR-" <> existingContribution.contributionId
+          recipients
+          tokenType = AuditToken
+          reason = "corroboration_bonus"
+          sourceEventId = existingContribution.contributionId
+
+        create Contribution with
+          contributionId = existingContribution.contributionId
+          contributorsData = mergedContributors
+          operator
+          auditor
+          transactionId
+          contributionData
+          trustScore = computeTrustScoreTree (Map.values mergedContributors)
+          originalSubmissionDate = existingContribution.originalSubmissionDate
+          disputeDates = existingContribution.disputeDates
+          createdAt = now
+
+    choice OpenDispute : ContractId Dispute
+      with
+        existingContributionCid : ContractId Contribution
+        contributorData : ContributorData
+        tokenMintAuthorityCid : ContractId TokenMintAuthority
+      controller operator
+      do
+        existingContribution <- fetch existingContributionCid
+        assertMsg "Contributions must be about the same transaction" (existingContribution.transactionId == transactionId)
+
+        -- A party already on the record cannot dispute it. The disputeId below relies on that,
+        -- since it makes a party's dispute per transaction unique.
+        assertMsg "Contributor must be different" (contributorData.contributor `notElem` (Map.keys existingContribution.contributorsData))
+
+        assertMsg "The contribution data must not match" (existingContribution.contributionData /= contributionData)
+
+        -- allData index 0 is the existing data, index 1 the disputing data
+        let existingDataIndex = 0
+            newDataIndex = 1
+            votes = Map.fromList [(contributorData.contributor, newDataIndex)]
+            initialPositions = foldl (\acc party -> Map.insert party existingDataIndex acc) votes (Map.keys existingContribution.contributorsData)
+
+        archive existingContributionCid
+
+        now <- getTime
+        create Dispute with
+          disputeId = "DISP-" <> shortPartyName contributorData.contributor <> "-" <> existingContribution.contributionId
+          initialPositions
+          votes
+          contributorsData = Map.insert
+            contributorData.contributor
+            (contributorData with disputeCoefficient = _internalReputationInitial_)
+            existingContribution.contributorsData
+          allData = [existingContribution.contributionData, contributionData]
+          operator
+          auditor
+          disputedContributionId = existingContribution.contributionId
+          transactionId
+          reason = "Conflict between contributions"
+          -- Vote copies this onto the resolved Contribution, so it must be the record's original
+          -- date and not the dispute's.
+          originalSubmissionDate = existingContribution.originalSubmissionDate
+          originalDisputeDates = existingContribution.disputeDates
+          createdAt = now
+          tokenMintAuthorityCid
+
+    choice JoinExistentDispute : ContractId Dispute
+      with
+        existingDisputeCid : ContractId Dispute
+        contributorData : ContributorData
+      controller operator
+      do
+        existingDispute <- fetch existingDisputeCid
+        assertMsg "Disputes must be about the same transaction"
+          (existingDispute.transactionId == transactionId)
+
+        exercise existingDisputeCid AddDisputer with
+          newContributorData = contributorData
+          newContributorContributionData = contributionData
+
+    choice RejectContribution : ()
+      with
+        reason : Text
+      controller operator
+      do pure ()
+
+    choice WithdrawContribution : ()
+      controller contributor
+      do pure ()
+
+template Dispute
+  with
+    disputeId : Text
+    contributorsData : Map Party ContributorData
+    operator : Party
+    auditor : Party
+    disputedContributionId : Text
+    transactionId : TransactionId
+    initialPositions: Map Party Int  -- Index into allData
+    votes : Map Party Int            -- Index into allData
+    allData : [ContributionData]
+    reason : Text
+    originalSubmissionDate : Time
+    originalDisputeDates : [Time]
+    createdAt : Time
+    tokenMintAuthorityCid : ContractId TokenMintAuthority  -- set at creation so Vote can mint
+  where
+    signatory operator
+    observer auditor :: (Map.keys contributorsData)
+
+    -- Identical options would split the vote and make unanimity unreachable. The options must
+    -- also pass the request validation, since ProposeDisputeData adds values that never went
+    -- through a ContributionRequest.
+    ensure reason /= "" && List.unique allData && all contributionDataIsValid allData
+
+    -- Left while voting continues, Right once the vote is unanimous and the dispute resolves.
+    choice Vote : Either (ContractId Dispute) (ContractId Contribution)
+      with
+        voteForDataIndex : Int
+        voter : Party
+      controller voter
+      do
+        assertMsg "Voter must be a contributor" (voter `elem` (Map.keys contributorsData))
+        assertMsg "Invalid vote index" (voteForDataIndex >= 0 && voteForDataIndex < length allData)
+
+        let newVotes = Map.insert voter voteForDataIndex votes
+
+        if size newVotes == size contributorsData && areUnanimous newVotes
+        then do
+          let winningIndex = case Map.toList newVotes of
+                [] -> error "Impossible: we checked that votes are not empty"
+                (_, idx) :: _ -> idx
+              winningData = allData !! winningIndex
+
+              winners = getWinnersInt initialPositions winningIndex
+
+              -- Internal reputation moves as an EWMA towards 1.0 for those whose initial
+              -- position won and 0.0 for the rest. The step is the smoothing factor times the
+              -- share of contributors who were wrong, so a dispute almost everyone had right
+              -- barely moves anyone. It stays inside [0,1] without clamping.
+              --
+              -- Through ProposeDisputeData the winning option can end up with no one standing on
+              -- it. Then nobody was right, and every reputation is left as it was.
+              step =
+                if List.null winners
+                then 0.0
+                else
+                  let decisiveness = 1.0 - (intToDecimal (length winners)) / (intToDecimal (size contributorsData))
+                  in _internalReputationSmoothing_ * decisiveness
+              cd = foldl (\acc c ->
+                              let target = if c.contributor `elem` winners then 1.0 else 0.0
+                                  moved = (1.0 - step) * c.disputeCoefficient + step * target
+                                  c' = c with disputeCoefficient = moved
+                              in Map.insert c.contributor c' acc
+                        ) Map.empty (Map.values contributorsData)
+
+          now <- getTime
+
+          let allContributors = Map.keys cd
+              recipients = map (\p -> (p, _auditTokenCorroborationBonus_)) allContributors
+
+          -- The voter cannot see the mint authority, so the submission must attach it as an
+          -- explicitly disclosed contract.
+          mintForEvent MintForEvent with
+            operator
+            auditor
+            authorityCid = tokenMintAuthorityCid
+            entitlementId = "MINT-DISP-" <> disputedContributionId
+            recipients
+            tokenType = AuditToken
+            reason = "dispute_resolution"
+            sourceEventId = disputeId
+
+          contributionCid <- create Contribution with
+            contributionId = disputedContributionId
+            contributorsData = cd
+            operator
+            auditor
+            transactionId
+            contributionData = winningData
+            trustScore = computeTrustScoreTree (Map.values cd)
+            originalSubmissionDate
+            disputeDates = now :: originalDisputeDates
+            createdAt = now
+          pure (Right contributionCid)
+        else do
+          now <- getTime
+          disputeCid <- create this with votes = newVotes, createdAt = now
+          pure (Left disputeCid)
+
+    choice AddDisputer : ContractId Dispute
+      with
+        newContributorData : ContributorData
+        newContributorContributionData : ContributionData
+      controller operator
+      do
+        assertMsg "Contributor must not already be in dispute"
+          (newContributorData.contributor `notElem` Map.keys contributorsData)
+
+        let (dataIndex, allData') = case List.elemIndex newContributorContributionData allData of
+              Some idx -> (idx, allData)
+              None -> (length allData, allData <> [newContributorContributionData])
+
+            initialPositions' = Map.insert newContributorData.contributor dataIndex initialPositions
+            votes' = Map.insert newContributorData.contributor dataIndex votes
+            contributorsData' = Map.insert
+              newContributorData.contributor
+              (newContributorData with disputeCoefficient = _internalReputationInitial_)
+              contributorsData
+
+        now <- getTime
+        create this with
+          initialPositions = initialPositions'
+          votes = votes'
+          contributorsData = contributorsData'
+          allData = allData'
+          createdAt = now
+
+    -- For a party already in the dispute who thinks none of the options is right. Nonconsuming
+    -- so that the deduplication branch can hand over to Vote.
+    nonconsuming choice ProposeDisputeData : Either (ContractId Dispute) (ContractId Contribution)
+      with
+        proposer : Party
+        newContributionData : ContributionData
+      controller proposer
+      do
+        assertMsg "Proposer must already be a dispute contributor"
+          (proposer `elem` Map.keys contributorsData)
+
+        -- The ensure would refuse it anyway, but this gives the proposer a reason.
+        today <- toDateUTC <$> getTime
+        assertMsg "Proposed data is invalid: a sale date is required, a price, area or construction year must be above zero, and a room count cannot be negative"
+          (contributionDataIsValid newContributionData)
+        assertMsg "Proposed data is invalid: the sale date is in the future"
+          (saleDateNotAfter today newContributionData)
+
+        case List.elemIndex newContributionData allData of
+          -- already on the table: this is just a vote for that option
+          Some idx -> exercise self Vote with voteForDataIndex = idx, voter = proposer
+
+          -- A new option has only the proposer on it and a dispute has at least two contributors,
+          -- so this can never be unanimous.
+          None -> do
+            now <- getTime
+            archive self
+            let newDataIndex = length allData
+            disputeCid <- create this with
+              votes = Map.insert proposer newDataIndex votes
+
+              -- The proposer moves their initial position onto the new option. They win if it
+              -- wins, and lose if the dispute settles on the option they left.
+              initialPositions = Map.insert proposer newDataIndex initialPositions
+
+              allData = allData <> [newContributionData]
+              createdAt = now
+            pure (Left disputeCid)
+
+areUnanimous : Map Party Int -> Bool
+areUnanimous votes =
+  not (Map.null votes) &&
+  let votesList = Map.toList votes
+      firstVote = snd (head votesList)
+  in all (\(_, vote) -> vote == firstVote) votesList
+
+getWinnersInt : Map Party Int -> Int -> [Party]
+getWinnersInt initialPositions winningIndex =
+  let iniPosList = Map.toList initialPositions
+  in [party | (party, idx) <- iniPosList, idx == winningIndex]
+
+-- A contribution's trust score is the sum of one score per role. The contributors are grouped by
+-- the role they declared and each group is scored on its own, so a role nobody declared adds 0.
+computeTrustScoreTree : [ContributorData] -> TrustScoreTree
+computeTrustScoreTree cds =
+  let compareRoles = (==) <$> [Buyer, Seller, Broker, Notary, TaxAuthority]
+      -- one RoleScore per role, in the order of the list above
+      rolesT = computeTrustScoreRole <$> (map (\x -> List.filter (\cd -> x cd.roleInTransaction) cds) compareRoles)
+  in TrustScoreTree
+      { total = foldl (\acc rs -> acc + rs.roleScore) 0.0 rolesT
+      , buyer = head rolesT
+      , seller = rolesT !! 1
+      , broker = rolesT !! 2
+      , notary = rolesT !! 3
+      , taxAuthority = last rolesT
+      }
+
+-- Scores the contributors who declared one role (the list holds a single role):
+--   individual score = reputation * role coefficient
+--   role score       = average individual score * (1 + redundancy coefficient * log2 n)
+-- The average keeps the score from growing linearly with the number n of contributors, and the
+-- log term gives a second, third... contributor in the same role a shrinking bonus (none for n = 1).
+-- The individual scores and their sum are kept because the reward split reuses them.
+computeTrustScoreRole : [ContributorData] -> RoleScore
+computeTrustScoreRole [] = RoleScore with
+  roleScore = 0.0
+  sumIndividualScores = 0.0
+  contributorScores = []
+computeTrustScoreRole cds =
+  let roleCoefficient = case (head cds).roleInTransaction of
+            -- taken from the declared role only, even if the party held more than one
+            Buyer -> _standardTrustScoreCoefficient_
+            Seller -> _standardTrustScoreCoefficient_
+            Broker -> _brokerTrustScoreCoefficient_
+            Notary -> _notaryTrustScoreCoefficient_
+            TaxAuthority -> _taxAuthorityTrustScoreCoefficient_
+
+      (total, individualScores) =
+        foldl (\(acc, scores) cd ->
+          let score = cd.reputation * roleCoefficient
+          in (acc + score, (cd.contributor, score) :: scores)
+        ) (0.0, []) cds
+
+      len = intToDecimal $ length individualScores
+      averageTrustScore = total / len
+      redundancyBonus = 1.0 + _redundancyBonusCoefficient_ * (logBase 2.0 len)
+  in RoleScore with
+    roleScore = averageTrustScore * redundancyBonus
+    sumIndividualScores = total
+    contributorScores = individualScores

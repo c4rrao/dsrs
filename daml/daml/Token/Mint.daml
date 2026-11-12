@@ -1,0 +1,92 @@
+module Token.Mint where
+
+import Types
+import Token.Holding
+
+-- Signed once by the auditor at bootstrap. Every HoldingOffer needs the auditor's signature, so
+-- the operator can only mint by claiming an entitlement through this contract.
+template TokenMintAuthority
+  with
+    operator : Party
+    auditor : Party
+  where
+    signatory auditor
+    observer operator
+
+    nonconsuming choice ClaimMintEntitlement : [ContractId HoldingOffer]
+      with
+        entitlementCid : ContractId MintEntitlement
+      controller operator
+      do
+        entitlement <- fetch entitlementCid
+        assertMsg "Entitlement must be for this operator" (entitlement.operator == operator)
+        assertMsg "Entitlement must be for this auditor" (entitlement.auditor == auditor)
+
+        archive entitlementCid
+
+        now <- getTime
+        forA entitlement.recipients $ \(recipient, amount) ->
+          create HoldingOffer with
+            from = case entitlement.tokenType of
+              AuditToken -> auditor
+              RewardToken -> operator
+            to = recipient
+            issuer = case entitlement.tokenType of
+              AuditToken -> auditor
+              RewardToken -> operator
+            witness = case entitlement.tokenType of
+              AuditToken -> operator
+              RewardToken -> auditor
+            tokenType = entitlement.tokenType
+            amount
+            cancellable = False
+            reference = Some (entitlement.reason <> ": " <> entitlement.sourceEventId)
+            createdAt = now
+
+-- The record of a mint. The auditor observes it, and claiming archives it so it cannot be used
+-- twice. Nothing checks that the event it names actually happened.
+template MintEntitlement
+  with
+    entitlementId : Text
+    operator : Party
+    auditor : Party
+    recipients : [(Party, Int)]
+    tokenType : TokenType
+    reason : Text                -- e.g. "corroboration_bonus", "query_completion"
+    sourceEventId : Text
+    createdAt : Time
+  where
+    signatory operator
+    observer auditor
+
+    ensure not (null recipients) && all (\(_, amt) -> amt > 0) recipients
+
+-- A record so that two swapped Party or Text arguments cannot typecheck.
+data MintForEvent = MintForEvent
+  with
+    operator : Party
+    auditor : Party
+    authorityCid : ContractId TokenMintAuthority
+    entitlementId : Text
+    recipients : [(Party, Int)]
+    tokenType : TokenType
+    reason : Text
+    sourceEventId : Text
+
+-- Creates the entitlement and claims it in the same transaction. An empty or non-positive
+-- recipient list is rejected by MintEntitlement's ensure, so callers decide beforehand whether
+-- that case is an error or just nothing to mint.
+mintForEvent : MintForEvent -> Update ()
+mintForEvent m = do
+  now <- getTime
+  entitlementCid <- create MintEntitlement with
+    entitlementId = m.entitlementId
+    operator = m.operator
+    auditor = m.auditor
+    recipients = m.recipients
+    tokenType = m.tokenType
+    reason = m.reason
+    sourceEventId = m.sourceEventId
+    createdAt = now
+  _ <- exercise m.authorityCid ClaimMintEntitlement with entitlementCid
+  pure ()

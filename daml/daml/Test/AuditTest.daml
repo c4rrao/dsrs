@@ -1,0 +1,538 @@
+module Test.AuditTest where
+
+import Daml.Script
+import DA.Optional (isNone, isSome)
+
+import Types
+import Token.Holding
+import Audit
+
+data TestParties = TestParties with
+  operator : Party
+  auditor : Party
+  requester : Party
+  stranger : Party
+
+setupParties : Script TestParties
+setupParties = do
+  operator <- allocateParty "Operator"
+  auditor <- allocateParty "Auditor"
+  requester <- allocateParty "Requester"
+  stranger <- allocateParty "Stranger"
+  pure TestParties{..}
+
+pricingParams : AuditRequestParams
+pricingParams = AuditRequestParams with
+  queryId = Some "FUNDED-Charlie-001"
+  proposalId = Some "PROP-Charlie-001"
+  rewardGroupId = None
+  transactionId = None
+  fromTime = None
+  toTime = None
+
+inclusionParams : AuditRequestParams
+inclusionParams = AuditRequestParams with
+  queryId = None
+  proposalId = None
+  rewardGroupId = None
+  transactionId = Some "TX-2024-LISBON-001"
+  fromTime = None
+  toTime = None
+
+createAuditTokens : TestParties -> Int -> Script (ContractId Holding)
+createAuditTokens tp amount = do
+  now <- getTime
+  submitMulti [tp.auditor, tp.operator, tp.requester] [] do
+    createCmd Holding with
+      owner = tp.requester
+      issuer = tp.auditor
+      witness = tp.operator
+      tokenType = AuditToken
+      amount
+      locker = None
+      lockReleaseTime = None
+      createdAt = now
+
+createRewardTokens : TestParties -> Int -> Script (ContractId Holding)
+createRewardTokens tp amount = do
+  now <- getTime
+  submitMulti [tp.operator, tp.auditor, tp.requester] [] do
+    createCmd Holding with
+      owner = tp.requester
+      issuer = tp.operator
+      witness = tp.auditor
+      tokenType = RewardToken
+      amount
+      locker = None
+      lockReleaseTime = None
+      createdAt = now
+
+createRequest : TestParties -> AuditRequestType -> AuditRequestParams -> Script (ContractId AuditRequest)
+createRequest tp requestType params = do
+  now <- getTime
+  submit tp.requester do
+    createCmd AuditRequest with
+      requestId = "AUDIT-REQ-001"
+      requester = tp.requester
+      auditor = tp.auditor
+      requestType
+      params
+      createdAt = now
+
+createProposal : TestParties -> Int -> Script (ContractId AuditProposal)
+createProposal tp cost = do
+  reqCid <- createRequest tp PricingVerification pricingParams
+  submit tp.auditor do
+    exerciseCmd reqCid ProposeAuditPrice with
+      estimatedCost = cost
+      description = "Verify pricing for FUNDED-Charlie-001"
+
+createFunded : TestParties -> Int -> Int -> Script (ContractId FundedAuditRequest)
+createFunded tp cost tokenAmount = do
+  propCid <- createProposal tp cost
+  holdingCid <- createAuditTokens tp tokenAmount
+  submit tp.requester do
+    exerciseCmd propCid FundAudit with auditTokenHoldingCid = holdingCid
+
+createFundedOf : TestParties -> AuditRequestType -> AuditRequestParams -> Script (ContractId FundedAuditRequest)
+createFundedOf tp requestType params = do
+  reqCid <- createRequest tp requestType params
+  propCid <- submit tp.auditor do
+    exerciseCmd reqCid ProposeAuditPrice with
+      estimatedCost = 3000
+      description = "priced"
+  holdingCid <- createAuditTokens tp 3000
+  submit tp.requester do
+    exerciseCmd propCid FundAudit with auditTokenHoldingCid = holdingCid
+
+sampleInsight : Decimal -> Insight
+sampleInsight avgPrice = Level1 with
+  base = InsightBase with
+    transactionCount = 3
+    avgSalePrice = Some avgPrice
+    avgTrustScore = Some 4.5
+    avgYearBuilt = Some 1998.3333
+    avgSquareMeters = Some 92.5
+    avgNumberOfRooms = Some 3.0
+    medianEnergyRating = Some B
+
+num : Int -> AuditValue
+num n = AuditValue with number = n, statistics = None
+
+priced : Int -> [Insight] -> AuditValue
+priced n stats = AuditValue with number = n, statistics = Some stats
+
+testProposeAuditPrice : Script ()
+testProposeAuditPrice = do
+  tp <- setupParties
+  reqCid <- createRequest tp PricingVerification pricingParams
+
+  propCid <- submit tp.auditor do
+    exerciseCmd reqCid ProposeAuditPrice with
+      estimatedCost = 5000
+      description = "Verify pricing"
+
+  Some proposal <- queryContractId tp.requester propCid
+  assertMsg "cost carried onto the proposal" (proposal.estimatedCost == 5000)
+  assertMsg "request id carried forward" (proposal.requestId == "AUDIT-REQ-001")
+  assertMsg "type carried forward" (proposal.requestType == PricingVerification)
+
+  reqGone <- queryContractId tp.requester reqCid
+  assertMsg "the request is consumed by pricing it" (isNone reqGone)
+
+testRequesterCannotProposeOwnPrice : Script ()
+testRequesterCannotProposeOwnPrice = do
+  tp <- setupParties
+  reqCid <- createRequest tp InclusionVerification inclusionParams
+  submitMustFail tp.requester do
+    exerciseCmd reqCid ProposeAuditPrice with
+      estimatedCost = 1
+      description = "priced by the person paying"
+
+testDeclineAuditRequest : Script ()
+testDeclineAuditRequest = do
+  tp <- setupParties
+  reqCid <- createRequest tp PricingVerification pricingParams
+
+  submit tp.auditor do
+    exerciseCmd reqCid DeclineAuditRequest with
+      reason = "pricing verification belongs to the consumer who paid for the query"
+
+  reqGone <- queryContractId tp.requester reqCid
+  assertMsg "declining consumes the request" (isNone reqGone)
+
+  proposals <- query @AuditProposal tp.requester
+  assertMsg "no price is quoted for a question that was refused" (null proposals)
+
+testRequesterCannotDecline : Script ()
+testRequesterCannotDecline = do
+  tp <- setupParties
+  reqCid <- createRequest tp PricingVerification pricingParams
+  submitMustFail tp.requester do
+    exerciseCmd reqCid DeclineAuditRequest with reason = "never mind"
+
+testCancelAuditRequest : Script ()
+testCancelAuditRequest = do
+  tp <- setupParties
+  reqCid <- createRequest tp RewardVerification pricingParams
+
+  submit tp.requester do exerciseCmd reqCid CancelAuditRequest
+
+  reqGone <- queryContractId tp.requester reqCid
+  assertMsg "cancelling consumes the request" (isNone reqGone)
+
+testAuditorCannotCancelRequest : Script ()
+testAuditorCannotCancelRequest = do
+  tp <- setupParties
+  reqCid <- createRequest tp RewardVerification pricingParams
+  submitMustFail tp.auditor do exerciseCmd reqCid CancelAuditRequest
+
+testFundAudit : Script ()
+testFundAudit = do
+  tp <- setupParties
+  propCid <- createProposal tp 5000
+  holdingCid <- createAuditTokens tp 10000
+
+  fundedCid <- submit tp.requester do
+    exerciseCmd propCid FundAudit with auditTokenHoldingCid = holdingCid
+
+  Some funded <- queryContractId tp.requester fundedCid
+  assertMsg "the funded request records what was paid" (funded.tokenAmount == 5000)
+
+  Some locked <- queryContractId tp.requester funded.holdingCid
+  assertMsg "the tokens are locked to the auditor" (locked.locker == Some tp.auditor)
+  assertMsg "only the quoted cost is locked, not the whole holding" (locked.amount == 5000)
+
+  -- only the quoted cost is locked, the rest of the balance stays free
+  holdings <- query @Holding tp.requester
+  let unlockedAmounts = [h.amount | (_, h) <- holdings, isNone h.locker]
+  assertMsg "the remainder stays unlocked with the requester" (unlockedAmounts == [5000])
+
+  propGone <- queryContractId tp.requester propCid
+  assertMsg "funding consumes the proposal" (isNone propGone)
+
+testFundAuditRejectsRewardTokens : Script ()
+testFundAuditRejectsRewardTokens = do
+  tp <- setupParties
+  propCid <- createProposal tp 5000
+  wrongTokens <- createRewardTokens tp 10000
+  submitMustFail tp.requester do
+    exerciseCmd propCid FundAudit with auditTokenHoldingCid = wrongTokens
+
+testFundAuditRejectsInsufficientTokens : Script ()
+testFundAuditRejectsInsufficientTokens = do
+  tp <- setupParties
+  propCid <- createProposal tp 5000
+  tooFew <- createAuditTokens tp 4999
+  submitMustFail tp.requester do
+    exerciseCmd propCid FundAudit with auditTokenHoldingCid = tooFew
+
+testFundAuditAcceptsExactAmount : Script ()
+testFundAuditAcceptsExactAmount = do
+  tp <- setupParties
+  propCid <- createProposal tp 5000
+  exact <- createAuditTokens tp 5000
+  fundedCid <- submit tp.requester do
+    exerciseCmd propCid FundAudit with auditTokenHoldingCid = exact
+  Some funded <- queryContractId tp.requester fundedCid
+  assertMsg "funded at exactly the quoted price" (funded.tokenAmount == 5000)
+
+testRejectAuditProposal : Script ()
+testRejectAuditProposal = do
+  tp <- setupParties
+  propCid <- createProposal tp 999999
+
+  submit tp.requester do
+    exerciseCmd propCid RejectAuditProposal
+
+  propGone <- queryContractId tp.requester propCid
+  assertMsg "rejecting consumes the proposal" (isNone propGone)
+
+testWithdrawAuditProposal : Script ()
+testWithdrawAuditProposal = do
+  tp <- setupParties
+  propCid <- createProposal tp 5000
+
+  submit tp.auditor do
+    exerciseCmd propCid WithdrawAuditProposal
+
+  propGone <- queryContractId tp.auditor propCid
+  assertMsg "withdrawing consumes the proposal" (isNone propGone)
+
+testProposalExitsAreNotInterchangeable : Script ()
+testProposalExitsAreNotInterchangeable = do
+  tp <- setupParties
+  propCid <- createProposal tp 5000
+  submitMustFail tp.auditor do
+    exerciseCmd propCid RejectAuditProposal
+
+  propCid2 <- createProposal tp 5000
+  submitMustFail tp.requester do
+    exerciseCmd propCid2 WithdrawAuditProposal
+
+testStrangerCannotFund : Script ()
+testStrangerCannotFund = do
+  tp <- setupParties
+  propCid <- createProposal tp 5000
+  holdingCid <- createAuditTokens tp 10000
+  submitMustFail tp.stranger do
+    exerciseCmd propCid FundAudit with auditTokenHoldingCid = holdingCid
+
+testCompleteAudit : Script ()
+testCompleteAudit = do
+  tp <- setupParties
+  fundedCid <- createFunded tp 5000 10000
+
+  resultCid <- submit tp.auditor do
+    exerciseCmd fundedCid CompleteAudit with
+      result = VerificationResult with
+        expected = num 208034826
+        actual = num 208034826
+        matches = True
+        details = "Price verified correctly"
+
+  Some auditResult <- queryContractId tp.requester resultCid
+  assertMsg "the verdict is stored" auditResult.result.matches
+  assertMsg "the numbers behind the verdict are stored too"
+    (auditResult.result.expected.number == 208034826)
+  assertMsg "the burn is recorded as proof of payment" (auditResult.tokensBurned == 5000)
+  assertMsg "the result names the verification type"
+    (auditResult.verificationType == PricingVerification)
+
+  fundedGone <- queryContractId tp.requester fundedCid
+  assertMsg "completing consumes the funded request" (isNone fundedGone)
+
+testCompleteAuditWithMismatch : Script ()
+testCompleteAuditWithMismatch = do
+  tp <- setupParties
+  fundedCid <- createFunded tp 5000 10000
+
+  resultCid <- submit tp.auditor do
+    exerciseCmd fundedCid CompleteAudit with
+      result = VerificationResult with
+        expected = num 3
+        actual = num 2
+        matches = False
+        details = "Inclusion mismatch: matched 3 query(ies) but was rewarded in only 2"
+
+  Some auditResult <- queryContractId tp.requester resultCid
+  assertMsg "a finding is recorded, not swallowed" (not auditResult.result.matches)
+  assertMsg "and it is nameable" (auditResult.result.expected.number == 3 && auditResult.result.actual.number == 2)
+
+-- The stored verdict has to agree with the stored values, so anyone can recompute it.
+testCompleteAuditRejectsFalseMatch : Script ()
+testCompleteAuditRejectsFalseMatch = do
+  tp <- setupParties
+  fundedCid <- createFunded tp 5000 10000
+  submitMustFail tp.auditor do
+    exerciseCmd fundedCid CompleteAudit with
+      result = VerificationResult with
+        expected = num 100
+        actual = num 42
+        matches = True
+        details = "claiming agreement between two different numbers"
+
+testCompleteAuditRejectsFalseMismatch : Script ()
+testCompleteAuditRejectsFalseMismatch = do
+  tp <- setupParties
+  fundedCid <- createFunded tp 5000 10000
+  submitMustFail tp.auditor do
+    exerciseCmd fundedCid CompleteAudit with
+      result = VerificationResult with
+        expected = num 100
+        actual = num 100
+        matches = False
+        details = "claiming disagreement between two identical numbers"
+
+testCompleteAuditWithAgreeingStatistics : Script ()
+testCompleteAuditWithAgreeingStatistics = do
+  tp <- setupParties
+  fundedCid <- createFunded tp 5000 10000
+  let stats = [sampleInsight 250000.0]
+  resultCid <- submit tp.auditor do
+    exerciseCmd fundedCid CompleteAudit with
+      result = VerificationResult with
+        expected = priced 208034826 stats
+        actual = priced 208034826 stats
+        matches = True
+        details = "Price verified correctly; statistics agree"
+  Some auditResult <- queryContractId tp.requester resultCid
+  assertMsg "the verdict is stored" auditResult.result.matches
+  assertMsg "each side stores the statistics beside the price"
+    (auditResult.result.expected.statistics == Some stats
+      && auditResult.result.actual.statistics == Some stats)
+
+testCompleteAuditWithWrongStatistics : Script ()
+testCompleteAuditWithWrongStatistics = do
+  tp <- setupParties
+  fundedCid <- createFunded tp 5000 10000
+  resultCid <- submit tp.auditor do
+    exerciseCmd fundedCid CompleteAudit with
+      result = VerificationResult with
+        expected = priced 208034826 [sampleInsight 250000.0]
+        actual = priced 208034826 [sampleInsight 275000.0]
+        matches = False
+        details = "Price verified correctly; statistics disagree on avgSalePrice"
+  Some auditResult <- queryContractId tp.requester resultCid
+  assertMsg "the finding is recorded although the prices agree" (not auditResult.result.matches)
+
+testCompleteAuditRejectsMatchOverWrongStatistics : Script ()
+testCompleteAuditRejectsMatchOverWrongStatistics = do
+  tp <- setupParties
+  fundedCid <- createFunded tp 5000 10000
+  submitMustFail tp.auditor do
+    exerciseCmd fundedCid CompleteAudit with
+      result = VerificationResult with
+        expected = priced 208034826 [sampleInsight 250000.0]
+        actual = priced 208034826 [sampleInsight 275000.0]
+        matches = True
+        details = "claiming agreement over statistics that differ"
+
+testCompleteAuditRejectsMismatchOverAgreeingStatistics : Script ()
+testCompleteAuditRejectsMismatchOverAgreeingStatistics = do
+  tp <- setupParties
+  fundedCid <- createFunded tp 5000 10000
+  let stats = [sampleInsight 250000.0]
+  submitMustFail tp.auditor do
+    exerciseCmd fundedCid CompleteAudit with
+      result = VerificationResult with
+        expected = priced 208034826 stats
+        actual = priced 208034826 stats
+        matches = False
+        details = "claiming disagreement over identical statistics"
+
+testCompleteAuditRejectsOneSidedStatistics : Script ()
+testCompleteAuditRejectsOneSidedStatistics = do
+  tp <- setupParties
+  fundedCid <- createFunded tp 5000 10000
+  submitMustFail tp.auditor do
+    exerciseCmd fundedCid CompleteAudit with
+      result = VerificationResult with
+        expected = priced 208034826 [sampleInsight 250000.0]
+        actual = num 208034826
+        matches = False
+        details = "statistics on the expected side only"
+
+testStatisticsOnlyOnPricing : Script ()
+testStatisticsOnlyOnPricing = do
+  tp <- setupParties
+  fundedCid <- createFundedOf tp InclusionVerification inclusionParams
+  let stats = [sampleInsight 250000.0]
+  submitMustFail tp.auditor do
+    exerciseCmd fundedCid CompleteAudit with
+      result = VerificationResult with
+        expected = priced 3 stats
+        actual = priced 3 stats
+        matches = True
+        details = "statistics on an inclusion check"
+
+testRequesterCannotCompleteAudit : Script ()
+testRequesterCannotCompleteAudit = do
+  tp <- setupParties
+  fundedCid <- createFunded tp 5000 10000
+  submitMustFail tp.requester do
+    exerciseCmd fundedCid CompleteAudit with
+      result = VerificationResult with
+        expected = num 1
+        actual = num 1
+        matches = True
+        details = "marking my own homework"
+
+testRefundAudit : Script ()
+testRefundAudit = do
+  tp <- setupParties
+  fundedCid <- createFunded tp 5000 10000
+
+  returnedCid <- submit tp.auditor do
+    exerciseCmd fundedCid RefundAudit with
+      reason = "the query this audit refers to could not be found"
+
+  Some returned <- queryContractId tp.requester returnedCid
+  assertMsg "the tokens come back to the requester" (returned.owner == tp.requester)
+  assertMsg "the locked portion comes back in full" (returned.amount == 5000)
+  assertMsg "and unlocked" (isNone returned.locker)
+
+  fundedGone <- queryContractId tp.requester fundedCid
+  assertMsg "refunding consumes the funded request" (isNone fundedGone)
+
+testRefundAuditRequiresReason : Script ()
+testRefundAuditRequiresReason = do
+  tp <- setupParties
+  fundedCid <- createFunded tp 5000 10000
+  submitMustFail tp.auditor do
+    exerciseCmd fundedCid RefundAudit with reason = ""
+
+testRequesterCannotRefund : Script ()
+testRequesterCannotRefund = do
+  tp <- setupParties
+  fundedCid <- createFunded tp 5000 10000
+  submitMustFail tp.requester do
+    exerciseCmd fundedCid RefundAudit with reason = "I changed my mind"
+
+-- The operator is not a stakeholder of any audit contract; seeing a request would tell it what
+-- is about to be checked.
+testOperatorSeesNoStageOfAnAudit : Script ()
+testOperatorSeesNoStageOfAnAudit = do
+  tp <- setupParties
+
+  reqCid <- createRequest tp InclusionVerification inclusionParams
+  reqSeen <- queryContractId tp.operator reqCid
+  assertMsg "the operator cannot see the request" (isNone reqSeen)
+
+  propCid <- submit tp.auditor do
+    exerciseCmd reqCid ProposeAuditPrice with
+      estimatedCost = 3000
+      description = "Verify inclusion for TX-2024-LISBON-001"
+  propSeen <- queryContractId tp.operator propCid
+  assertMsg "nor the quoted price" (isNone propSeen)
+
+  holdingCid <- createAuditTokens tp 5000
+  fundedCid <- submit tp.requester do
+    exerciseCmd propCid FundAudit with auditTokenHoldingCid = holdingCid
+  fundedSeen <- queryContractId tp.operator fundedCid
+  assertMsg "nor that the audit was funded and is about to run" (isNone fundedSeen)
+
+  resultCid <- submit tp.auditor do
+    exerciseCmd fundedCid CompleteAudit with
+      result = VerificationResult with
+        expected = num 3
+        actual = num 3
+        matches = True
+        details = "Inclusion verified"
+  resultSeen <- queryContractId tp.operator resultCid
+  assertMsg "nor the finding" (isNone resultSeen)
+
+  requesterSees <- queryContractId tp.requester resultCid
+  assertMsg "the requester gets their answer" (isSome requesterSees)
+  auditorSees <- queryContractId tp.auditor resultCid
+  assertMsg "and the auditor keeps its record" (isSome auditorSees)
+
+testStrangerSeesNothing : Script ()
+testStrangerSeesNothing = do
+  tp <- setupParties
+  reqCid <- createRequest tp PricingVerification pricingParams
+  seen <- queryContractId tp.stranger reqCid
+  assertMsg "an unrelated party cannot see an audit request" (isNone seen)
+
+testAllThreeVerificationTypes : Script ()
+testAllThreeVerificationTypes = do
+  tp <- setupParties
+  let go requestType params = do
+        now <- getTime
+        reqCid <- submit tp.requester do
+          createCmd AuditRequest with
+            requestId = "AUDIT-REQ-" <> show requestType
+            requester = tp.requester
+            auditor = tp.auditor
+            requestType
+            params
+            createdAt = now
+        submit tp.auditor do
+          exerciseCmd reqCid ProposeAuditPrice with
+            estimatedCost = 1000
+            description = "priced"
+
+  _ <- go PricingVerification pricingParams
+  _ <- go RewardVerification (pricingParams with rewardGroupId = Some "DIST-001")
+  _ <- go InclusionVerification inclusionParams
+  pure ()

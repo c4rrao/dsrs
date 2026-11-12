@@ -1,0 +1,87 @@
+participant.domains.connect_local(mydomain)
+
+utils.retry_until_true(30.seconds) {
+  participant.domains.list_connected().nonEmpty
+}
+
+println("Participant connected to domain.")
+
+// The 10 MiB default is reached by a distribution over roughly 1,000 matched transactions
+// (about 4.5 KB each). canton.conf's max-inbound-message-size must stay >= this.
+mydomain.service.set_max_request_size(33554432)
+println(s"Domain maxRequestSize = ${mydomain.service.get_max_request_size}")
+
+// The script runs on every container start but the volumes outlive the container, and
+// enabling an existing party or user fails hard, so reuse what is already there.
+
+import com.digitalasset.canton.topology.PartyId
+
+def ensureParty(name: String): PartyId = {
+  val existing = participant.parties.list(filterParty = name).map(_.party)
+  existing.headOption.getOrElse(participant.parties.enable(name))
+}
+
+def ensureUser(userId: String, party: PartyId): Unit =
+  try {
+    participant.ledger_api.users.create(
+      id = userId,
+      actAs = Set(party),
+      primaryParty = Some(party)
+    )
+  } catch {
+    case _: Throwable => println(s"  user $userId already exists, reusing it")
+  }
+
+val operatorParty = ensureParty("Operator")
+val auditorParty = ensureParty("Auditor")
+val escrowParty = ensureParty("Escrow")
+println(s"Operator Party: ${operatorParty.toLf}")
+println(s"Auditor Party: ${auditorParty.toLf}")
+println(s"Escrow Party: ${escrowParty.toLf}")
+
+val aliceParty = ensureParty("Alice")
+val bobParty = ensureParty("Bob")
+val charlieParty = ensureParty("Charlie")
+val dianaParty = ensureParty("Diana")
+val eveParty = ensureParty("Eve")
+println(s"Alice Party: ${aliceParty.toLf}")
+println(s"Bob Party: ${bobParty.toLf}")
+println(s"Charlie Party: ${charlieParty.toLf}")
+println(s"Diana Party: ${dianaParty.toLf}")
+println(s"Eve Party: ${eveParty.toLf}")
+
+val darPath = "/daml/.daml/dist/data-sharing-reward-system-1.0.0.dar"
+participant.dars.upload(darPath)
+
+println("DAR uploaded to participant.")
+
+// Navigator users
+ensureUser("operator_user", operatorParty)
+ensureUser("auditor_user", auditorParty)
+ensureUser("escrow_user", escrowParty)
+ensureUser("alice_user", aliceParty)
+ensureUser("bob_user", bobParty)
+ensureUser("charlie_user", charlieParty)
+ensureUser("diana_user", dianaParty)
+ensureUser("eve_user", eveParty)
+
+println("Users created for Navigator.")
+
+println("")
+println("=" * 50)
+println("Bootstrap complete. Canton is ready for use.")
+println("=" * 50)
+println("")
+println("System parties:")
+println(s"  Operator:    ${operatorParty.toLf}")
+println(s"  Auditor:     ${auditorParty.toLf}")
+println(s"  Escrow:      ${escrowParty.toLf}")
+println("")
+println("User parties:")
+println(s"  Alice:     ${aliceParty.toLf}")
+println(s"  Bob:       ${bobParty.toLf}")
+println(s"  Charlie:   ${charlieParty.toLf}")
+println(s"  Diana:     ${dianaParty.toLf}")
+println(s"  Eve:       ${eveParty.toLf}")
+println("")
+println("All parties are on the same participant node.")

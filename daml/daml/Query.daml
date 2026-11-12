@@ -1,0 +1,286 @@
+module Query where
+
+import Types
+import Constants
+import Token.Holding
+import Token.Mint
+import Reward
+import Pricing (PricingConfig, CalculatePrice(..))
+
+import DA.Optional (fromSome, isSome, isNone)
+
+template QueryRequest
+  with
+    requestId : Text
+    consumer : Party
+    operator : Party
+    auditor : Party
+    params : QueryParams
+    requestDate : Time
+    createdAt : Time
+  where
+    signatory consumer
+    observer operator, auditor
+
+    choice ProposeCost : ContractId QueryProposal
+      with
+        escrows : [Party]
+        pricingConfigCid : ContractId PricingConfig
+        metadata : PricingMetadata
+      controller operator
+      do
+        assertMsg "At least one escrow must be provided" (not $ null escrows)
+
+        -- First of the two privacy gates: a query below the floor is never priced, so nobody pays
+        -- for an answer that cannot be delivered. The count is the operator's own claim; an
+        -- overstated count is caught by the auditor recomputing it from its history.
+        assertMsg
+          ( "Query matches " <> show metadata.numTransactions
+            <> " transaction(s); minimum " <> show _minTransactionsForPrivacy_
+            <> " required to preserve contributor privacy" )
+          (metadata.numTransactions >= _minTransactionsForPrivacy_)
+
+        let level = params.level
+        tokenCost <- exercise pricingConfigCid CalculatePrice with
+          numTransactions = metadata.numTransactions
+          corpusTransactions = metadata.corpusTransactions
+          level = level
+          addressSelectivity = metadata.addressSelectivity
+          salePriceSelectivity = metadata.salePriceSelectivity
+          saleDateSelectivity = metadata.saleDateSelectivity
+          squareMetersSelectivity = metadata.squareMetersSelectivity
+          yearBuiltSelectivity = metadata.yearBuiltSelectivity
+          roomsSelectivity = metadata.roomsSelectivity
+          propertyTypeSelectivity = metadata.propertyTypeSelectivity
+          energyRatingSelectivity = metadata.energyRatingSelectivity
+          tagsSelectivity = metadata.tagsSelectivity
+          trustQuality = metadata.trustQuality
+
+        assertMsg "Calculated token cost must be positive" (tokenCost > 0)
+
+        now <- getTime
+        create QueryProposal with
+          proposalId = "PROPOSAL-" <> shortPartyName consumer <> "-" <> show now
+          possibleEscrows = escrows
+          signerEscrow = None
+          proposalDate = now
+          pricingMetadata = metadata
+          pricingConfigCid
+          auditor
+          createdAt = now
+          ..
+
+    choice RejectQueryRequest : ()
+      with
+        reason : Text
+      controller operator
+      do pure ()
+
+    choice WithdrawQueryRequest : ()
+      controller consumer
+      do pure ()
+
+template QueryProposal
+  with
+    proposalId : Text
+    consumer : Party
+    operator : Party
+    auditor : Party
+    possibleEscrows : [Party]
+    signerEscrow : Optional Party
+    params : QueryParams
+    tokenCost : Int
+    proposalDate : Time
+    pricingMetadata : PricingMetadata
+    pricingConfigCid : ContractId PricingConfig
+    createdAt : Time
+  where
+    -- the escrow joins as a signatory by accepting the proposal
+    signatory operator :: (case signerEscrow of {Some d -> [d]; None -> []})
+    observer auditor :: consumer :: possibleEscrows
+
+    choice LockFundsForQuery : ContractId FundedQuery
+      with
+        payedHoldingCid : ContractId Holding
+      controller consumer
+      do
+        assertMsg "No escrow accepted the proposal" (isSome signerEscrow)
+
+        holding <- fetch payedHoldingCid
+        assertMsg "Insufficient token balance" (holding.amount >= tokenCost)
+        assertMsg "Wrong token type" (holding.tokenType == RewardToken)
+        assertMsg "Wrong issuer - must be operator" (holding.issuer == operator)
+        assertMsg "Wrong witness - must be auditor" (holding.witness == auditor)
+
+        now <- getTime
+
+        paymentHoldingCid <-
+          if holding.amount == tokenCost
+          then pure payedHoldingCid
+          else do
+            (h1, _remainderCid) <- exercise payedHoldingCid Split with splitAmount = tokenCost
+            pure h1
+
+        offerCid <- exercise paymentHoldingCid TransferAll with
+                      recipient = fromSome signerEscrow
+                      reference = Some ("query_payment: " <> proposalId)
+        holdingCid <- exercise offerCid AcceptHoldingOffer
+
+        lockedHoldingCid <- exercise holdingCid Lock with
+          locker = operator
+          releaseTime = None
+
+        create FundedQuery with
+          queryId = "FUNDED-" <> shortPartyName consumer <> "-" <> show now
+          escrow = fromSome signerEscrow
+          fundedDate = now
+          auditor
+          createdAt = now
+          ..
+
+    choice AcceptEscrowRole : ContractId QueryProposal
+      with
+        acceptor : Party
+      controller acceptor
+      do
+        assertMsg "Acceptor must be in possibleEscrows" (acceptor `elem` possibleEscrows)
+        assertMsg "An escrow has already accepted" (isNone signerEscrow)
+        now <- getTime
+        create this with signerEscrow = Some acceptor, createdAt = now
+
+    choice SetPossibleEscrows : ContractId QueryProposal
+      with
+        newEscrows : [Party]
+      controller operator
+      do
+        assertMsg "At least one escrow must be provided" (not $ null newEscrows)
+        now <- getTime
+        create this with possibleEscrows = newEscrows; signerEscrow = None; createdAt = now
+
+    choice RejectQueryProposal: ()
+      controller consumer
+      do pure ()
+
+    -- The proposal pins the contribution set it was priced over, and the operator holds
+    -- contribution processing still while it stands. Funding has no deadline, so the operator
+    -- withdraws a proposal once its hold expires. Nothing is locked before LockFundsForQuery, so
+    -- the consumer loses nothing.
+    choice ExpireQueryProposal : ()
+      with
+        reason : Text
+      controller operator
+      do
+        assertMsg "Reason required" (reason /= "")
+        pure ()
+
+template FundedQuery
+  with
+    queryId : Text
+    proposalId : Text
+    consumer : Party
+    operator : Party
+    auditor : Party
+    escrow : Party
+    params : QueryParams
+    tokenCost : Int
+    lockedHoldingCid : ContractId Holding
+    fundedDate : Time
+    createdAt : Time
+  where
+    signatory operator, consumer, escrow
+    observer auditor
+
+    choice CompleteQuery : (ContractId QueryResult, ContractId Reward)
+      with
+        queryResults : [Insight]
+        executionTimestamp : Time  -- the instant the auditor replays the query at
+        tokenMintAuthorityCid : ContractId TokenMintAuthority
+      controller operator
+      do
+        -- Second privacy gate, on what is actually delivered. The insights are the ones pinned at
+        -- pricing, so a dispute opened after pricing does not shrink the count here.
+        assertMsg "A completed query must carry at least one insight" (not $ null queryResults)
+        assertMsg
+          ( "An insight aggregates fewer than " <> show _minTransactionsForPrivacy_
+            <> " transaction(s), which would identify the contributors behind it" )
+          (all (\i -> insightTransactionCount i >= _minTransactionsForPrivacy_) queryResults)
+
+        now <- getTime
+
+        let auditTokenAmount = floor $ (intToDecimal tokenCost) * _auditTokenQueryRate_
+
+        if auditTokenAmount > 0
+        then mintForEvent MintForEvent with
+          operator
+          auditor
+          authorityCid = tokenMintAuthorityCid
+          entitlementId = "MINT-QUERY-" <> queryId
+          recipients = [(consumer, auditTokenAmount)]
+          tokenType = AuditToken
+          reason = "query_completion"
+          sourceEventId = queryId
+        else
+          pure ()
+
+        rCid <- create Reward with
+          distributionId = "DIST-" <> shortPartyName consumer <> "-" <> show now
+          queryId
+          escrow
+          operator
+          auditor
+          holdingCid = lockedHoldingCid
+          distributionDate = now
+          createdAt = now
+
+        qCid <- create QueryResult with
+          resultId = "RESULT-" <> shortPartyName consumer <> "-" <> show now
+          completionDate = now
+          executionTimestamp
+          results = queryResults
+          auditor
+          createdAt = now
+          ..
+
+        pure (qCid, rCid)
+
+    choice FailQuery : ContractId Holding
+      with
+        failureReason : Text
+      controller operator
+      do
+        holdingCid <- exercise lockedHoldingCid Unlock
+        offerCid <- exercise holdingCid TransferAll with
+                      recipient = consumer
+                      reference = Some ("query_refund: " <> failureReason)
+        exercise offerCid AcceptHoldingOffer
+
+    -- Lets the consumer recover the payment if the operator never completes or fails the query.
+    -- The deadline is the lock's release time, enforced by RemoveLock.
+    choice ReclaimExpiredFunds : ContractId Holding
+      controller consumer
+      do
+        -- FundedQuery carries the escrow's signature, which RemoveLock and TransferAll need.
+        holdingCid <- exercise lockedHoldingCid RemoveLock
+        offerCid <- exercise holdingCid TransferAll with
+                      recipient = consumer
+                      reference = Some ("query_reclaim: " <> queryId)
+        exercise offerCid AcceptHoldingOffer
+
+template QueryResult
+  with
+    resultId : Text
+    queryId : Text
+    proposalId : Text  -- lets the auditor walk a result back to the metadata it was priced with
+    consumer : Party
+    operator : Party
+    auditor : Party
+    params : QueryParams
+    tokenCost : Int
+    completionDate : Time
+    executionTimestamp : Time
+    results : [Insight]
+    createdAt : Time
+
+  where
+    signatory operator
+    observer consumer, auditor

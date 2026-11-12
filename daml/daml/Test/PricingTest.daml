@@ -1,0 +1,319 @@
+-- These check properties of the price rather than fixed numbers: more data costs more, each
+-- extra transaction is worth less, coverage is worth paying for, narrowing accelerates but never
+-- outruns the volume it loses, and trust prices both above and below the corpus average.
+module Test.PricingTest where
+
+import Daml.Script
+import DA.Optional (fromSome)
+
+import Pricing
+import Token.Holding (eurToToken)
+
+data TestParties = TestParties with
+  operator : Party
+  auditor : Party
+  public : Party
+
+setupParties : Script TestParties
+setupParties = do
+  operator <- allocateParty "Operator"
+  auditor <- allocateParty "Auditor"
+  public <- allocateParty "Public"
+  pure TestParties{..}
+
+setupDefaultPricingConfig : Party -> Party -> Party -> Script (ContractId PricingConfig)
+setupDefaultPricingConfig operator auditor public = do
+  now <- getTime
+  submit operator do
+    createCmd (defaultPricingConfig operator auditor public now)
+
+-- Every selectivity and trustQuality default to 0.0, the neutral point of every factor.
+priceWith :
+  Party -> ContractId PricingConfig
+  -> Int -> Int -> Int
+  -> Decimal -> Decimal -> Decimal -> Decimal -> Decimal -> Decimal -> Decimal -> Decimal -> Decimal
+  -> Decimal
+  -> Script Int
+priceWith operator cid n bigN level addr price date sqm year rooms typ energy tags trust =
+  submit operator do
+    exerciseCmd cid CalculatePrice with
+      numTransactions = n
+      corpusTransactions = bigN
+      level
+      addressSelectivity = addr
+      salePriceSelectivity = price
+      saleDateSelectivity = date
+      squareMetersSelectivity = sqm
+      yearBuiltSelectivity = year
+      roomsSelectivity = rooms
+      propertyTypeSelectivity = typ
+      energyRatingSelectivity = energy
+      tagsSelectivity = tags
+      trustQuality = trust
+
+plain : Party -> ContractId PricingConfig -> Int -> Int -> Script Int
+plain op cid n bigN = priceWith op cid n bigN 1 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0
+
+oneFilter : Party -> ContractId PricingConfig -> Int -> Int -> Decimal -> Script Int
+oneFilter op cid n bigN s = priceWith op cid n bigN 1 0.0 s 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0
+
+withTrust : Party -> ContractId PricingConfig -> Int -> Int -> Decimal -> Script Int
+withTrust op cid n bigN q = priceWith op cid n bigN 1 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 q
+
+testDefaultPricingConfig : Script ()
+testDefaultPricingConfig = do
+  TestParties{..} <- setupParties
+  cid <- setupDefaultPricingConfig operator auditor public
+  config <- queryContractId operator cid
+  let c = fromSome config
+  assertMsg "Base price should be 10 EUR in tokens" (c.basePrice == eurToToken 10.0)
+  assertMsg "Level 1 multiplier should be 1.0" (c.level1Multiplier == 1.0)
+  assertMsg "Level 2 multiplier should be 3.0" (c.level2Multiplier == 3.0)
+  assertMsg "Coverage weight should be 2.0" (c.coverageWeight == 2.0)
+  assertMsg "Coverage saturation should be 5.0" (c.coverageSaturation == 5.0)
+  assertMsg "Narrowness weight should be 0.5" (c.narrownessWeight == 0.5)
+  assertMsg "Trust weight should be 4.0" (c.trustWeight == 4.0)
+  pure ()
+
+testUpdatePricingConfig : Script ()
+testUpdatePricingConfig = do
+  TestParties{..} <- setupParties
+  cid <- setupDefaultPricingConfig operator auditor public
+  updated <- submit operator do
+    exerciseCmd cid UpdateConfig with
+      newBasePrice = eurToToken 20.0
+      newLevel1Multiplier = 1.5
+      newLevel2Multiplier = 4.0
+      newCoverageWeight = 3.0
+      newCoverageSaturation = 4.0
+      newNarrownessWeight = 1.0
+      newTrustWeight = 8.0
+  config <- queryContractId operator updated
+  let u = fromSome config
+  assertMsg "Base price should be updated" (u.basePrice == eurToToken 20.0)
+  assertMsg "Coverage weight should be updated" (u.coverageWeight == 3.0)
+  assertMsg "Narrowness weight should be updated" (u.narrownessWeight == 1.0)
+  assertMsg "Trust weight should be updated" (u.trustWeight == 8.0)
+  pure ()
+
+testUpdateConfigRejectsInvalidWeights : Script ()
+testUpdateConfigRejectsInvalidWeights = do
+  TestParties{..} <- setupParties
+  cid <- setupDefaultPricingConfig operator auditor public
+  let upd bp l1 l2 cw cs nw tw = submitMustFail operator do
+        exerciseCmd cid UpdateConfig with
+          newBasePrice = bp
+          newLevel1Multiplier = l1
+          newLevel2Multiplier = l2
+          newCoverageWeight = cw
+          newCoverageSaturation = cs
+          newNarrownessWeight = nw
+          newTrustWeight = tw
+  upd 0 1.0 3.0 2.0 5.0 0.5 4.0                     -- base price must be positive
+  upd (eurToToken 10.0) 0.0 3.0 2.0 5.0 0.5 4.0     -- level multiplier must be positive
+  upd (eurToToken 10.0) 1.0 3.0 (-1.0) 5.0 0.5 4.0  -- coverage weight must be positive
+  upd (eurToToken 10.0) 1.0 3.0 2.0 0.0 0.5 4.0     -- coverage saturation must be positive
+  upd (eurToToken 10.0) 1.0 3.0 2.0 5.0 (-0.5) 4.0  -- narrowness weight must be >= 0
+  upd (eurToToken 10.0) 1.0 3.0 2.0 5.0 0.5 0.5     -- trust weight must be > 1
+  -- each of these values switches one term of the price off entirely
+  upd (eurToToken 10.0) 1.0 3.0 0.0 5.0 0.5 4.0     -- coverage term off
+  upd (eurToToken 10.0) 1.0 3.0 2.0 5.0 0.5 1.0     -- quality term off
+  pure ()
+
+testMoreTransactionsCostMore : Script ()
+testMoreTransactionsCostMore = do
+  TestParties{..} <- setupParties
+  cid <- setupDefaultPricingConfig operator auditor public
+  small <- plain operator cid 10 1000
+  large <- plain operator cid 100 1000
+  assertMsg "100 matched transactions must cost more than 10" (large > small)
+  pure ()
+
+testMarginalTransactionIsWorthLess : Script ()
+testMarginalTransactionIsWorthLess = do
+  TestParties{..} <- setupParties
+  cid <- setupDefaultPricingConfig operator auditor public
+  a <- plain operator cid 10 100000
+  b <- plain operator cid 11 100000
+  c <- plain operator cid 1000 100000
+  d <- plain operator cid 1001 100000
+  assertMsg "Adding the 11th transaction must be worth more than adding the 1001st"
+    ((b - a) > (d - c))
+  pure ()
+
+-- 1000 of 2000 against 1000 of 1,000,000.
+testCoverageOfTheCorpusIsWorthPaying : Script ()
+testCoverageOfTheCorpusIsWorthPaying = do
+  TestParties{..} <- setupParties
+  cid <- setupDefaultPricingConfig operator auditor public
+  sliver <- plain operator cid 1000 1000000
+  half <- plain operator cid 1000 2000
+  assertMsg "1000 of 2000 must cost meaningfully more than 1000 of a million"
+    (half > sliver * 2)
+  pure ()
+
+testCoveragePremiumSaturates : Script ()
+testCoveragePremiumSaturates = do
+  TestParties{..} <- setupParties
+  cid <- setupDefaultPricingConfig operator auditor public
+  low <- plain operator cid 100 10000    -- 1% coverage
+  mid <- plain operator cid 100 500      -- 20% coverage
+  full <- plain operator cid 100 100     -- 100% coverage
+  assertMsg "Coverage must raise the price" (full > mid && mid > low)
+  assertMsg "The climb from 20% to 100% must be smaller than from 1% to 20%"
+    ((full - mid) < (mid - low))
+  pure ()
+
+-- Coverage is a premium for completeness, never a penalty for a large corpus.
+testSmallSliceStillHasValue : Script ()
+testSmallSliceStillHasValue = do
+  TestParties{..} <- setupParties
+  cid <- setupDefaultPricingConfig operator auditor public
+  sliver <- plain operator cid 100 100000000
+  tiny <- plain operator cid 5 100000000
+  assertMsg "100 rows of a vast corpus must still cost more than 5 rows of it" (sliver > tiny)
+  pure ()
+
+testNarrowerCostsMore : Script ()
+testNarrowerCostsMore = do
+  TestParties{..} <- setupParties
+  cid <- setupDefaultPricingConfig operator auditor public
+  wide <- oneFilter operator cid 100 1000 0.2
+  narrow <- oneFilter operator cid 100 1000 0.8
+  unfiltered <- plain operator cid 100 1000
+  assertMsg "A narrower filter must cost more" (narrow > wide)
+  assertMsg "Any filter must cost at least the unfiltered price" (wide > unfiltered)
+  pure ()
+
+testNarrownessPremiumAccelerates : Script ()
+testNarrownessPremiumAccelerates = do
+  TestParties{..} <- setupParties
+  cid <- setupDefaultPricingConfig operator auditor public
+  a <- oneFilter operator cid 100 1000 0.0
+  b <- oneFilter operator cid 100 1000 0.4
+  c <- oneFilter operator cid 100 1000 0.8
+  assertMsg "Narrowing 0.4 -> 0.8 must cost more than narrowing 0.0 -> 0.4"
+    ((c - b) > (b - a))
+  pure ()
+
+-- This is what fixes narrownessWeight at 0.5: above roughly 0.6 a narrower query can cost more
+-- for less data. Each filter here halves the match count.
+testNarrowingNeverOutrunsVolumeLost : Script ()
+testNarrowingNeverOutrunsVolumeLost = do
+  TestParties{..} <- setupParties
+  cid <- setupDefaultPricingConfig operator auditor public
+  full <- plain operator cid 100 100
+  oneCut <- priceWith operator cid 50 100 1 0.0 0.67 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0
+  twoCuts <- priceWith operator cid 25 100 1 0.0 0.67 0.67 0.0 0.0 0.0 0.0 0.0 0.0 0.0
+  fourCuts <- priceWith operator cid 6 100 1 0.0 0.67 0.67 0.67 0.67 0.0 0.0 0.0 0.0 0.0
+  assertMsg "One filter halving the results must not raise the price" (oneCut <= full)
+  assertMsg "Price must keep falling as the result set shrinks"
+    (twoCuts < oneCut && fourCuts < twoCuts)
+  pure ()
+
+testEveryDimensionIsPricedTheSameWay : Script ()
+testEveryDimensionIsPricedTheSameWay = do
+  TestParties{..} <- setupParties
+  cid <- setupDefaultPricingConfig operator auditor public
+  let s = 0.6
+  addr <- priceWith operator cid 100 1000 1 s 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0
+  price <- priceWith operator cid 100 1000 1 0.0 s 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0
+  date <- priceWith operator cid 100 1000 1 0.0 0.0 s 0.0 0.0 0.0 0.0 0.0 0.0 0.0
+  sqm <- priceWith operator cid 100 1000 1 0.0 0.0 0.0 s 0.0 0.0 0.0 0.0 0.0 0.0
+  year <- priceWith operator cid 100 1000 1 0.0 0.0 0.0 0.0 s 0.0 0.0 0.0 0.0 0.0
+  rooms <- priceWith operator cid 100 1000 1 0.0 0.0 0.0 0.0 0.0 s 0.0 0.0 0.0 0.0
+  typ <- priceWith operator cid 100 1000 1 0.0 0.0 0.0 0.0 0.0 0.0 s 0.0 0.0 0.0
+  energy <- priceWith operator cid 100 1000 1 0.0 0.0 0.0 0.0 0.0 0.0 0.0 s 0.0 0.0
+  tags <- priceWith operator cid 100 1000 1 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 s 0.0
+  assertMsg "Every narrowness dimension must price identically for the same selectivity"
+    (all (== addr) [price, date, sqm, year, rooms, typ, energy, tags])
+  pure ()
+
+testSelectivityIsClamped : Script ()
+testSelectivityIsClamped = do
+  TestParties{..} <- setupParties
+  cid <- setupDefaultPricingConfig operator auditor public
+  atMax <- oneFilter operator cid 100 1000 1.0
+  beyond <- oneFilter operator cid 100 1000 5.0
+  below <- oneFilter operator cid 100 1000 (-3.0)
+  unfiltered <- plain operator cid 100 1000
+  assertMsg "Selectivity above 1 must price as 1" (beyond == atMax)
+  assertMsg "Negative selectivity must price as unfiltered" (below == unfiltered)
+  pure ()
+
+-- The term is an exponent rather than a square because x² cannot tell above from below.
+testTrustPricesBothSidesOfTheAverage : Script ()
+testTrustPricesBothSidesOfTheAverage = do
+  TestParties{..} <- setupParties
+  cid <- setupDefaultPricingConfig operator auditor public
+  best <- withTrust operator cid 100 1000 1.0
+  good <- withTrust operator cid 100 1000 0.5
+  average <- withTrust operator cid 100 1000 0.0
+  poor <- withTrust operator cid 100 1000 (-0.5)
+  worst <- withTrust operator cid 100 1000 (-1.0)
+  plainPrice <- plain operator cid 100 1000
+  assertMsg "Corpus-average quality must be exactly neutral" (average == plainPrice)
+  assertMsg "Quality must be monotonic across the whole range"
+    (best > good && good > average && average > poor && poor > worst)
+  assertMsg "The best data must cost about 4x the average (trustWeight)"
+    (best > average * 3 && best < average * 5)
+  assertMsg "The worst data must be discounted to about a quarter"
+    (worst * 3 < average)
+  pure ()
+
+testTrustQualityIsClamped : Script ()
+testTrustQualityIsClamped = do
+  TestParties{..} <- setupParties
+  cid <- setupDefaultPricingConfig operator auditor public
+  atMax <- withTrust operator cid 100 1000 1.0
+  beyond <- withTrust operator cid 100 1000 4.0
+  assertMsg "Quality above 1 must price as 1" (beyond == atMax)
+  pure ()
+
+testLevel2CostsMoreThanLevel1 : Script ()
+testLevel2CostsMoreThanLevel1 = do
+  TestParties{..} <- setupParties
+  cid <- setupDefaultPricingConfig operator auditor public
+  l1 <- plain operator cid 100 1000
+  l2 <- priceWith operator cid 100 1000 2 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0
+  assertMsg "Level 2 must cost 3x Level 1" (l2 >= l1 * 3 - 3 && l2 <= l1 * 3 + 3)
+  pure ()
+
+testUnfilteredQueryReducesToTheSimpleForm : Script ()
+testUnfilteredQueryReducesToTheSimpleForm = do
+  TestParties{..} <- setupParties
+  cid <- setupDefaultPricingConfig operator auditor public
+  everything <- plain operator cid 3 3
+  assertMsg "Full-corpus query must be about base x 2 x 3" (everything > 59000000 && everything < 60000000)
+  pure ()
+
+testCorpusSmallerThanMatchedIsRejected : Script ()
+testCorpusSmallerThanMatchedIsRejected = do
+  TestParties{..} <- setupParties
+  cid <- setupDefaultPricingConfig operator auditor public
+  submitMustFail operator do
+    exerciseCmd cid CalculatePrice with
+      numTransactions = 100
+      corpusTransactions = 10
+      level = 1
+      addressSelectivity = 0.0
+      salePriceSelectivity = 0.0
+      saleDateSelectivity = 0.0
+      squareMetersSelectivity = 0.0
+      yearBuiltSelectivity = 0.0
+      roomsSelectivity = 0.0
+      propertyTypeSelectivity = 0.0
+      energyRatingSelectivity = 0.0
+      tagsSelectivity = 0.0
+      trustQuality = 0.0
+  pure ()
+
+testMinimumPriceIsOne : Script ()
+testMinimumPriceIsOne = do
+  TestParties{..} <- setupParties
+  now <- getTime
+  cid <- submit operator do
+    createCmd (defaultPricingConfig operator auditor public now) with basePrice = 1
+  p <- priceWith operator cid 0 1000000 1 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 (-1.0)
+  assertMsg "Price must never fall below one token" (p >= 1)
+  pure ()

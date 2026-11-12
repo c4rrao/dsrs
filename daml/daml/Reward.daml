@@ -1,0 +1,233 @@
+module Reward where
+
+import Types
+import Constants
+import Token.Holding
+import Token.Mint
+import Contribution
+
+import DA.Action (foldlA)
+
+import qualified DA.Map as Map
+
+template Reward
+  with
+    distributionId : Text
+    queryId : Text
+    operator : Party
+    auditor : Party
+    escrow : Party
+    holdingCid : ContractId Holding
+    distributionDate : Time
+    createdAt : Time
+  where
+    signatory operator, escrow
+    observer auditor
+
+    choice DistributePerTransaction : ()
+      with
+        -- Only ids: each weight is read off the contract here, so the split across records is
+        -- computed by the ledger and not by the operator.
+        contributionCids : [ContractId Contribution]
+        -- Must equal the total computed from the fetched contracts, so a distribution built from a
+        -- stale view of the corpus aborts instead of paying out. Both sides are Decimal, so
+        -- exact equality is the right test.
+        claimedTotalTrustScore : Decimal
+      controller operator
+      do
+        holding <- fetch holdingCid
+
+        assertMsg "Wrong token type" (holding.tokenType == RewardToken)
+        assertMsg "Wrong issuer - must be operator" (holding.issuer == operator)
+        assertMsg "Wrong witness - must be auditor" (holding.witness == auditor)
+        assertMsg "Holding owner must be the escrow" (holding.owner == escrow)
+        assertMsg "Holding must be locked for the operator" (holding.locker == Some operator)
+
+        assertMsg "Holding must have a minimum amount to distribute rewards (> 0.01 EUR)" (holding.amount > eurToToken 0.01)
+        assertMsg "contributions must not be empty" (not (null contributionCids))
+
+        contributions <- forA contributionCids fetch
+
+        let totalTS = foldl (\acc c -> acc + c.trustScore.total) 0.0 contributions
+
+        assertMsg
+          ( "Supplied total trust score " <> show claimedTotalTrustScore
+              <> " does not match the " <> show totalTS
+              <> " carried by the contributions being distributed to" )
+          (totalTS == claimedTotalTrustScore)
+
+        unlockedHoldingCid <- exercise holdingCid Unlock
+
+        let operatorFee = floor $ _operatorFeePercentage_ * (intToDecimal holding.amount)
+            escrowFee = floor $ _escrowFeePercentage_ * (intToDecimal holding.amount)
+            auditorFee = floor $ _auditorFeePercentage_ * (intToDecimal holding.amount)
+            remainingAmount = holding.amount - operatorFee - escrowFee - auditorFee
+
+        (_ , holdingCid1) <- exercise unlockedHoldingCid Transfer with
+                recipient = operator
+                transferAmount = operatorFee
+                reference = Some ("operator_fee: " <> queryId)
+
+        (_ , holdingCid2) <- exercise holdingCid1 Transfer with
+                recipient = auditor
+                transferAmount = auditorFee
+                reference = Some ("auditor_fee: " <> queryId)
+
+        -- the escrow's fee stays where it is, since the escrow already owns the holding
+
+        now <- getTime
+        _ <- foldlA (\(remHolding, counter) (contr, contribution) -> do
+
+                let ts = contribution.trustScore.total
+                    amount =
+                      if totalTS == 0.0 then 0
+                      else floor $ (ts / totalTS) * (intToDecimal remainingAmount)
+
+                if amount <= 0
+                then do
+                  pure (remHolding, counter)
+                else do
+                  (h1, h2) <- exercise remHolding Split with splitAmount = amount
+
+                  -- locked so the escrow cannot move it before the group is paid out
+                  h1' <- exercise h1 Lock with
+                          locker = operator
+                          releaseTime = None
+
+                  _ <- create RewardGroup with
+                          groupId = distributionId <> "-TX-" <> show counter
+                          queryId
+                          operator
+                          auditor
+                          escrow
+                          contributionCid = contr
+                          transactionId = contribution.transactionId
+                          trustScore = contribution.trustScore
+                          contributorsData = contribution.contributorsData
+                          holdingCid = h1'
+                          distributionDate
+                          createdAt = now
+
+                  pure (h2, counter + 1)
+
+              ) (holdingCid2, 1) (zip contributionCids contributions)
+        pure ()
+
+template RewardGroup
+  with
+    groupId : Text
+    queryId : Text
+    operator : Party
+    auditor : Party
+    escrow : Party
+    contributionCid : ContractId Contribution
+    transactionId : TransactionId  -- contributionCid does not survive a dispute, which recreates the record
+
+    -- Copied from the Contribution at the moment the pool was split, while the contribution set
+    -- was held still. DistributeInGroup divides by this copy and never fetches the Contribution,
+    -- which is what lets the operator release the set as soon as DistributePerTransaction commits.
+    trustScore : TrustScoreTree
+    contributorsData : Map.Map Party ContributorData
+
+    holdingCid : ContractId Holding
+    distributionDate : Time
+    createdAt : Time
+  where
+    signatory operator, escrow
+    -- Contributors observe the group so they learn the groupId a reward audit is keyed on. It
+    -- reveals nothing they cannot already see on the Contribution, and the amounts live in the
+    -- holding, which they are not stakeholders of. Contributors who join the record later are
+    -- not included.
+    observer auditor :: Map.keys contributorsData
+
+    choice DistributeInGroup: ()
+      with
+        tokenMintAuthorityCid : ContractId TokenMintAuthority
+      controller operator
+      do
+        holding <- fetch holdingCid
+
+        assertMsg "Wrong token type" (holding.tokenType == RewardToken)
+        assertMsg "Wrong issuer - must be operator" (holding.issuer == operator)
+        assertMsg "Wrong witness - must be auditor" (holding.witness == auditor)
+
+        let rewards = computeReward trustScore contributorsData holding.amount
+
+        let computeAuditAmount (_, rewardAmt) = floor $ (intToDecimal rewardAmt) * _auditTokenRewardRate_
+            auditRecipients = [(party, computeAuditAmount (party, rewardAmt)) | (party, rewardAmt) <- rewards]
+            validAuditRecipients = filter (\(_, amt) -> amt > 0) auditRecipients
+
+        if null validAuditRecipients
+        then pure ()
+        else mintForEvent MintForEvent with
+          operator
+          auditor
+          authorityCid = tokenMintAuthorityCid
+          entitlementId = "MINT-REWARD-" <> groupId
+          recipients = validAuditRecipients
+          tokenType = AuditToken
+          reason = "reward_distribution"
+          sourceEventId = groupId
+
+        unlockedHoldingCid <- exercise holdingCid Unlock
+
+        _ <- foldlA (\acc (recipient, reward) -> do
+                  if reward <= 0
+                  then pure acc
+                  else do
+                    -- the reference carries the groupId the contributor needs to request an audit
+                    (_, h2) <- exercise acc Transfer with
+                                    recipient
+                                    transferAmount = reward
+                                    reference = Some ("reward: " <> groupId)
+                    pure h2
+                ) unlockedHoldingCid rewards
+
+        pure ()
+
+-- Splits one transaction's reward among its contributors:
+-- 1. split the reward between roles in proportion to their role scores
+-- 2. split each role's share between its contributors in proportion to their individual scores
+-- 3. multiply each contributor's share by their dispute coefficient (at most 1), so the shares
+--    now add up to less than the reward
+-- 4. scale every share by the same factor so they add up to the reward again; a contributor
+--    with a low coefficient ends up with less and the others with more
+-- Every step floors, so a few tokens can be left over in the escrow's holding.
+computeReward : TrustScoreTree -> Map.Map Party ContributorData -> Int -> [(Party, Int)]
+computeReward ts cds totalReward =
+  let roleSelectors = [buyer, seller, broker, notary, taxAuthority]
+
+      rawRewards = concatMap (computeRoleRewards ts cds totalReward) roleSelectors
+
+      actualTotal = foldl (\acc (_, r) -> acc + r) 0 rawRewards
+  in map (normalizeReward actualTotal totalReward) rawRewards
+
+-- Steps 1 to 3 for the role the selector picks out of the tree.
+computeRoleRewards : TrustScoreTree -> Map.Map Party ContributorData -> Int
+                   -> (TrustScoreTree -> RoleScore)
+                   -> [(Party, Int)]
+computeRoleRewards ts cds totalReward selector =
+  let rs = selector ts
+      -- step 1
+      roleReward = if ts.total == 0.0 then 0
+        else floor $ rs.roleScore / ts.total * intToDecimal totalReward
+  in map (\(contributor, score) ->
+      let coeff = getDisputeCoefficient cds contributor
+          -- steps 2 and 3
+          reward = if rs.sumIndividualScores == 0.0 then 0
+            else floor $ score / rs.sumIndividualScores * intToDecimal roleReward * coeff
+      in (contributor, reward)
+    ) rs.contributorScores
+
+-- Step 4 for one contributor: actualTotal is what steps 1 to 3 handed out in all.
+normalizeReward : Int -> Int -> (Party, Int) -> (Party, Int)
+normalizeReward actualTotal totalReward (contributor, reward) =
+  let reward' = if actualTotal == 0 then 0
+        else floor $ intToDecimal reward / intToDecimal actualTotal * intToDecimal totalReward
+  in (contributor, reward')
+
+getDisputeCoefficient : Map.Map Party ContributorData -> Party -> Decimal
+getDisputeCoefficient cds contributor =
+  case Map.lookup contributor cds of
+    None -> error "[BUG] contributor not found in contribution data"
+    Some cd -> cd.disputeCoefficient

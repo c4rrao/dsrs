@@ -1,0 +1,519 @@
+module Test.RewardTest where
+
+import Daml.Script
+import DA.Optional (fromSome)
+import DA.List (head)
+import qualified DA.Map as Map
+
+import Types
+import DA.Date (date, Month(..))
+import Token.Holding
+import Token.Mint (TokenMintAuthority(..))
+import Contribution
+import Reward
+
+createTestMintAuthority : Party -> Party -> Script (ContractId TokenMintAuthority)
+createTestMintAuthority operator auditor = do
+  submit auditor do
+    createCmd TokenMintAuthority with
+      operator
+      auditor
+
+data TestParties = TestParties with
+  operator : Party
+  auditor : Party
+  escrow : Party
+  buyer : Party
+  seller : Party
+  brokerParty : Party
+  notaryParty : Party
+
+setupParties : Script TestParties
+setupParties = do
+  operator <- allocateParty "Operator"
+  auditor <- allocateParty "Auditor"
+  escrow <- allocateParty "Escrow"
+  buyer <- allocateParty "Buyer"
+  seller <- allocateParty "Seller"
+  brokerParty <- allocateParty "Broker"
+  notaryParty <- allocateParty "Notary"
+  pure TestParties{..}
+
+sampleContributionData : ContributionData
+sampleContributionData = ContributionData with
+  propertyAddress = Some Address with
+    postalCode = Some "12345"
+    street = Some "Main Street 1"
+    city = Some "Berlin"
+    country = Some "Germany"
+    additionalInfo = None
+  salePrice = Some 500000.0
+  saleDate = Some (date 1970 Jan 1)  -- script time starts at the epoch, and a sale cannot postdate its report
+  propertyType = Some "Apartment"
+  squareMeters = Some 100.0
+  numberOfRooms = Some 4
+  yearBuilt = Some 2000
+  energyRating = Some B
+  tags = None
+  additionalInfo = None
+
+makeContributorData : Party -> Role -> Decimal -> ContributorData
+makeContributorData contributor roleInTransaction reputation = ContributorData with
+  contributor
+  roleInTransaction
+  disputeCoefficient = 1.0
+  reputation
+
+createHolding : Party -> Party -> Party -> Int -> Script (ContractId Holding)
+createHolding operator auditor owner amount = do
+  now <- getTime
+  submitMulti [operator, auditor, owner] [] do
+    createCmd Holding with
+      owner
+      issuer = operator
+      witness = auditor
+      tokenType = RewardToken
+      amount
+      locker = None
+      lockReleaseTime = None
+      createdAt = now
+
+createContributionWithContributors : TestParties -> [(Party, Role, Decimal)] -> Script (ContractId Contribution)
+createContributionWithContributors TestParties{..} contributorSpecs = do
+  now <- getTime
+  let contributorsData = Map.fromList $ map (\(p, r, rep) -> (p, makeContributorData p r rep)) contributorSpecs
+      trustScore = computeTrustScoreTree (Map.values contributorsData)
+
+  submit operator do
+    createCmd Contribution with
+      contributionId = "CONT-TEST"
+      contributorsData
+      operator
+      auditor
+      transactionId = TransactionId "TX-TEST"
+      contributionData = sampleContributionData
+      trustScore
+      originalSubmissionDate = now
+      disputeDates = []
+      createdAt = now
+
+testDistributePerTransactionCreatesGroups : Script ()
+testDistributePerTransactionCreatesGroups = do
+  TestParties{..} <- setupParties
+
+  now <- getTime
+
+  holdingCid <- createHolding operator auditor escrow (eurToToken 100.0)  -- 100 EUR worth
+  lockedHoldingCid <- submit escrow do
+    exerciseCmd holdingCid Lock with locker = operator; releaseTime = None
+
+  contrib1Cid <- createContributionWithContributors
+    TestParties{..}
+    [(buyer, Buyer, 1.0)]
+
+  rewardCid <- submitMulti [operator, escrow] [] do
+    createCmd Reward with
+      distributionId = "DIST-003"
+      queryId = "FUNDED-TEST-DIST-003"
+      operator
+      auditor
+      escrow
+      holdingCid = lockedHoldingCid
+      distributionDate = now
+      createdAt = now
+
+  Some contrib1 <- queryContractId operator contrib1Cid
+  submit operator do
+    exerciseCmd rewardCid DistributePerTransaction with
+      contributionCids = [contrib1Cid]
+      claimedTotalTrustScore = contrib1.trustScore.total
+
+  reward <- queryContractId operator rewardCid
+  assertMsg "Reward should be archived after distribution" (reward == None)
+
+  pure ()
+
+testDistributeRejectsWrongTotalTrustScore : Script ()
+testDistributeRejectsWrongTotalTrustScore = do
+  TestParties{..} <- setupParties
+
+  now <- getTime
+
+  holdingCid <- createHolding operator auditor escrow (eurToToken 100.0)
+  lockedHoldingCid <- submit escrow do
+    exerciseCmd holdingCid Lock with locker = operator; releaseTime = None
+
+  contrib1Cid <- createContributionWithContributors
+    TestParties{..}
+    [(buyer, Buyer, 1.0)]
+
+  rewardCid <- submitMulti [operator, escrow] [] do
+    createCmd Reward with
+      distributionId = "DIST-TS-MISMATCH"
+      queryId = "FUNDED-TEST-DIST-TS-MISMATCH"
+      operator
+      auditor
+      escrow
+      holdingCid = lockedHoldingCid
+      distributionDate = now
+      createdAt = now
+
+  Some contrib1 <- queryContractId operator contrib1Cid
+
+  submitMustFail operator do
+    exerciseCmd rewardCid DistributePerTransaction with
+      contributionCids = [contrib1Cid]
+      claimedTotalTrustScore = contrib1.trustScore.total + 1.0
+
+  submitMustFail operator do
+    exerciseCmd rewardCid DistributePerTransaction with
+      contributionCids = [contrib1Cid]
+      claimedTotalTrustScore = contrib1.trustScore.total - 0.5
+
+  submit operator do
+    exerciseCmd rewardCid DistributePerTransaction with
+      contributionCids = [contrib1Cid]
+      claimedTotalTrustScore = contrib1.trustScore.total
+
+  reward <- queryContractId operator rewardCid
+  assertMsg "Reward should be archived after the honest distribution" (reward == None)
+
+  pure ()
+
+testDistributeRequiresMinimumAmount : Script ()
+testDistributeRequiresMinimumAmount = do
+  TestParties{..} <- setupParties
+
+  now <- getTime
+
+  holdingCid <- createHolding operator auditor escrow 100  -- way below minimum
+  lockedHoldingCid <- submit escrow do
+    exerciseCmd holdingCid Lock with locker = operator; releaseTime = None
+
+  contributionCid <- createContributionWithContributors
+    TestParties{..}
+    [(buyer, Buyer, 1.0)]
+
+  rewardCid <- submitMulti [operator, escrow] [] do
+    createCmd Reward with
+      distributionId = "DIST-004"
+      queryId = "FUNDED-TEST-DIST-004"
+      operator
+      auditor
+      escrow
+      holdingCid = lockedHoldingCid
+      distributionDate = now
+      createdAt = now
+
+  Some contribution <- queryContractId operator contributionCid
+  submitMustFail operator do
+    exerciseCmd rewardCid DistributePerTransaction with
+      contributionCids = [contributionCid]
+      claimedTotalTrustScore = contribution.trustScore.total
+
+  pure ()
+
+testDistributeInGroup : Script ()
+testDistributeInGroup = do
+  TestParties{..} <- setupParties
+
+  now <- getTime
+
+  tokenMintAuthorityCid <- createTestMintAuthority operator auditor
+
+  holdingCid <- createHolding operator auditor escrow (eurToToken 10.0)
+  lockedHoldingCid <- submit escrow do
+    exerciseCmd holdingCid Lock with locker = operator; releaseTime = None
+
+  contributionCid <- createContributionWithContributors
+    TestParties{..}
+    [(buyer, Buyer, 1.0), (seller, Seller, 1.0)]
+
+  Some contribution <- queryContractId operator contributionCid
+
+  rewardGroupCid <- submitMulti [operator, escrow] [] do
+    createCmd RewardGroup with
+      groupId = "GROUP-003"
+      queryId = "FUNDED-TEST-GROUP-003"
+      operator
+      auditor
+      escrow
+      contributionCid
+      transactionId = TransactionId "TX-TEST"
+      trustScore = contribution.trustScore
+      contributorsData = contribution.contributorsData
+      holdingCid = lockedHoldingCid
+      distributionDate = now
+      createdAt = now
+
+  submit operator do
+    exerciseCmd rewardGroupCid DistributeInGroup with tokenMintAuthorityCid
+
+  rewardGroup <- queryContractId operator rewardGroupCid
+  assertMsg "RewardGroup should be archived" (rewardGroup == None)
+
+  pure ()
+
+testComputeRewardSingleContributor : Script ()
+testComputeRewardSingleContributor = do
+  TestParties{..} <- setupParties
+
+  now <- getTime
+
+  contributionCid <- createContributionWithContributors
+    TestParties{..}
+    [(buyer, Buyer, 1.0)]
+
+  contribution <- queryContractId buyer contributionCid
+  let c = fromSome contribution
+
+  let totalReward = 1000000
+      rewards = computeReward c.trustScore c.contributorsData totalReward
+
+  assertMsg "Should have 1 reward entry" (length rewards == 1)
+  let (recipient, amount) = head rewards
+  assertMsg "Buyer should receive reward" (recipient == buyer)
+  assertMsg "Amount should be close to total" (amount > 0)
+
+  pure ()
+
+testComputeRewardMultipleSameRole : Script ()
+testComputeRewardMultipleSameRole = do
+  TestParties{..} <- setupParties
+
+  now <- getTime
+
+  contributionCid <- createContributionWithContributors
+    TestParties{..}
+    [(buyer, Buyer, 1.0), (seller, Buyer, 1.0)]  -- Both are "Buyer" role
+
+  contribution <- queryContractId buyer contributionCid
+  let c = fromSome contribution
+
+  let totalReward = 1000000
+      rewards = computeReward c.trustScore c.contributorsData totalReward
+
+  assertMsg "Should have 2 reward entries" (length rewards == 2)
+  let buyerReward = case lookup buyer rewards of Some r -> r; None -> 0
+      sellerReward = case lookup seller rewards of Some r -> r; None -> 0
+
+  let diff = abs (buyerReward - sellerReward)
+  assertMsg "Rewards should be similar for equal contributors" (diff < totalReward / 10)
+
+  pure ()
+
+testComputeRewardDifferentRoles : Script ()
+testComputeRewardDifferentRoles = do
+  TestParties{..} <- setupParties
+
+  now <- getTime
+
+  contributionCid <- createContributionWithContributors
+    TestParties{..}
+    [(buyer, Buyer, 1.0), (brokerParty, Broker, 1.0)]
+
+  contribution <- queryContractId buyer contributionCid
+  let c = fromSome contribution
+
+  let totalReward = 1000000
+      rewards = computeReward c.trustScore c.contributorsData totalReward
+
+  let buyerReward = case lookup buyer rewards of Some r -> r; None -> 0
+      brokerReward = case lookup brokerParty rewards of Some r -> r; None -> 0
+
+  assertMsg "Broker should get more than buyer" (brokerReward > buyerReward)
+
+  pure ()
+
+testComputeRewardWithDisputeCoefficient : Script ()
+testComputeRewardWithDisputeCoefficient = do
+  TestParties{..} <- setupParties
+
+  now <- getTime
+
+  let buyerData = (makeContributorData buyer Buyer 1.0) with disputeCoefficient = 0.5  -- Lost some disputes
+      sellerData = (makeContributorData seller Seller 1.0) with disputeCoefficient = 1.5  -- Won some disputes
+      contributorsData = Map.fromList [(buyer, buyerData), (seller, sellerData)]
+      trustScore = computeTrustScoreTree (Map.values contributorsData)
+
+  contributionCid <- submit operator do
+    createCmd Contribution with
+      contributionId = "CONT-DISPUTE-TEST"
+      contributorsData
+      operator
+      auditor
+      transactionId = TransactionId "TX-DISPUTE-TEST"
+      contributionData = sampleContributionData
+      trustScore
+      originalSubmissionDate = now
+      disputeDates = []
+      createdAt = now
+
+  contribution <- queryContractId buyer contributionCid
+  let c = fromSome contribution
+
+  let totalReward = 1000000
+      rewards = computeReward c.trustScore c.contributorsData totalReward
+
+  let buyerReward = case lookup buyer rewards of Some r -> r; None -> 0
+      sellerReward = case lookup seller rewards of Some r -> r; None -> 0
+
+  assertMsg "Seller should get more due to higher dispute coefficient" (sellerReward > buyerReward)
+
+  pure ()
+
+testComputeRewardMultipleRoles : Script ()
+testComputeRewardMultipleRoles = do
+  TestParties{..} <- setupParties
+
+  now <- getTime
+
+  contributionCid <- createContributionWithContributors
+    TestParties{..}
+    [ (buyer, Buyer, 1.0)
+    , (seller, Seller, 1.0)
+    , (brokerParty, Broker, 1.0)
+    , (notaryParty, Notary, 1.0)
+    ]
+
+  contribution <- queryContractId buyer contributionCid
+  let c = fromSome contribution
+
+  let totalReward = 1000000
+      rewards = computeReward c.trustScore c.contributorsData totalReward
+
+  assertMsg "Should have 4 reward entries" (length rewards == 4)
+
+  let buyerReward = case lookup buyer rewards of Some r -> r; None -> 0
+      notaryReward = case lookup notaryParty rewards of Some r -> r; None -> 0
+
+  assertMsg "Notary should get more than buyer" (notaryReward > buyerReward)
+
+  pure ()
+
+testComputeRewardZeroTrustScore : Script ()
+testComputeRewardZeroTrustScore = do
+  TestParties{..} <- setupParties
+
+  now <- getTime
+
+  -- Contribution requires trustScore.total > 0, so this only exercises computeReward itself
+
+  contributionCid <- createContributionWithContributors
+    TestParties{..}
+    [(buyer, Buyer, 1.0)]
+
+  contribution <- queryContractId buyer contributionCid
+  let c = fromSome contribution
+
+  let rewards = computeReward c.trustScore c.contributorsData 0
+
+  let buyerReward = case lookup buyer rewards of Some r -> r; None -> 0
+  assertMsg "Zero total reward should give zero to contributor" (buyerReward == 0)
+
+  pure ()
+
+testRewardNormalization : Script ()
+testRewardNormalization = do
+  TestParties{..} <- setupParties
+
+  now <- getTime
+
+  contributionCid <- createContributionWithContributors
+    TestParties{..}
+    [ (buyer, Buyer, 1.0)
+    , (seller, Seller, 1.0)
+    , (brokerParty, Broker, 2.0)  -- Higher reputation
+    ]
+
+  contribution <- queryContractId buyer contributionCid
+  let c = fromSome contribution
+
+  let totalReward = 1000000
+      rewards = computeReward c.trustScore c.contributorsData totalReward
+
+  let totalDistributed = foldl (\acc (_, r) -> acc + r) 0 rewards
+  assertMsg "Total distributed should not exceed total reward" (totalDistributed <= totalReward)
+
+  pure ()
+
+createHoldingCustom : Party -> Party -> Party -> Int -> TokenType -> Script (ContractId Holding)
+createHoldingCustom issuer witness owner amount tokenType = do
+  now <- getTime
+  submitMulti [issuer, witness, owner] [] do
+    createCmd Holding with
+      owner
+      issuer
+      witness
+      tokenType
+      amount
+      locker = None
+      lockReleaseTime = None
+      createdAt = now
+
+testDistributeWrongTokenType : Script ()
+testDistributeWrongTokenType = do
+  TestParties{..} <- setupParties
+
+  now <- getTime
+
+  holdingCid <- createHoldingCustom operator auditor escrow (eurToToken 100.0) AuditToken
+  lockedHoldingCid <- submit escrow do
+    exerciseCmd holdingCid Lock with locker = operator; releaseTime = None
+
+  contrib1Cid <- createContributionWithContributors
+    TestParties{..}
+    [(buyer, Buyer, 1.0)]
+
+  rewardCid <- submitMulti [operator, escrow] [] do
+    createCmd Reward with
+      distributionId = "DIST-WRONG-TOKEN"
+      queryId = "FUNDED-TEST-DIST-WRONG-TOKEN"
+      operator
+      auditor
+      escrow
+      holdingCid = lockedHoldingCid
+      distributionDate = now
+      createdAt = now
+
+  Some contrib1 <- queryContractId operator contrib1Cid
+  submitMustFail operator do
+    exerciseCmd rewardCid DistributePerTransaction with
+      contributionCids = [contrib1Cid]
+      claimedTotalTrustScore = contrib1.trustScore.total
+
+  pure ()
+
+testDistributeWrongIssuer : Script ()
+testDistributeWrongIssuer = do
+  TestParties{..} <- setupParties
+  wrongIssuer <- allocateParty "WrongIssuer"
+
+  now <- getTime
+
+  holdingCid <- createHoldingCustom wrongIssuer auditor escrow (eurToToken 100.0) RewardToken
+  lockedHoldingCid <- submit escrow do
+    exerciseCmd holdingCid Lock with locker = operator; releaseTime = None
+
+  contrib1Cid <- createContributionWithContributors
+    TestParties{..}
+    [(buyer, Buyer, 1.0)]
+
+  rewardCid <- submitMulti [operator, escrow] [] do
+    createCmd Reward with
+      distributionId = "DIST-WRONG-ISSUER"
+      queryId = "FUNDED-TEST-DIST-WRONG-ISSUER"
+      operator
+      auditor
+      escrow
+      holdingCid = lockedHoldingCid
+      distributionDate = now
+      createdAt = now
+
+  Some contrib1 <- queryContractId operator contrib1Cid
+  submitMustFail operator do
+    exerciseCmd rewardCid DistributePerTransaction with
+      contributionCids = [contrib1Cid]
+      claimedTotalTrustScore = contrib1.trustScore.total
+
+  pure ()

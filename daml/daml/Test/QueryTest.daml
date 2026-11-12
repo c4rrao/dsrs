@@ -1,0 +1,1156 @@
+module Test.QueryTest where
+
+import Daml.Script
+import DA.Optional (fromSome, isSome, isNone)
+import DA.Time (days)
+
+import Types
+import Constants (_minTransactionsForPrivacy_)
+import Query
+import Pricing
+import Token.Holding
+import Token.Mint (TokenMintAuthority(..))
+
+createTestMintAuthority : Party -> Party -> Script (ContractId TokenMintAuthority)
+createTestMintAuthority operator auditor = do
+  submit auditor do
+    createCmd TokenMintAuthority with
+      operator
+      auditor
+
+data TestParties = TestParties with
+  operator : Party
+  auditor : Party
+  consumer : Party
+  escrow : Party
+  escrow2 : Party
+  public : Party
+
+setupParties : Script TestParties
+setupParties = do
+  operator <- allocateParty "Operator"
+  auditor <- allocateParty "Auditor"
+  consumer <- allocateParty "Consumer"
+  escrow <- allocateParty "Escrow"
+  escrow2 <- allocateParty "Escrow2"
+  public <- allocateParty "Public"
+  pure TestParties{..}
+
+sampleQueryParams : QueryParams
+sampleQueryParams = QueryParams with
+  level = 1
+  trustScore = None
+  propertyAddress = None
+  salePrice = None
+  saleDate = None
+  propertyTypes = None
+  squareMeters = None
+  numberOfRooms = None
+  yearBuilt = None
+  energyRating = None
+  tags = None
+
+samplePricingMetadata : PricingMetadata
+samplePricingMetadata = PricingMetadata with
+  numTransactions = 100
+  corpusTransactions = 1000
+  addressSelectivity = 0.0
+  salePriceSelectivity = 0.0
+  saleDateSelectivity = 0.0
+  squareMetersSelectivity = 0.0
+  yearBuiltSelectivity = 0.0
+  roomsSelectivity = 0.0
+  propertyTypeSelectivity = 0.0
+  energyRatingSelectivity = 0.0
+  tagsSelectivity = 0.0
+  trustQuality = 0.0
+
+setupPricingConfig : Party -> Party -> Party -> Script (ContractId PricingConfig)
+setupPricingConfig operator auditor public = do
+  now <- getTime
+  submit operator do
+    createCmd (defaultPricingConfig operator auditor public now)
+
+createHolding : Party -> Party -> Party -> Int -> Script (ContractId Holding)
+createHolding operator auditor owner amount = do
+  now <- getTime
+  submitMulti [operator, auditor, owner] [] do
+    createCmd Holding with
+      owner
+      issuer = operator
+      witness = auditor
+      tokenType = RewardToken
+      amount
+      locker = None
+      lockReleaseTime = None
+      createdAt = now
+
+testQueryRequestToProposal : Script ()
+testQueryRequestToProposal = do
+  TestParties{..} <- setupParties
+
+  now <- getTime
+  pricingCid <- setupPricingConfig operator auditor public
+
+  requestCid <- submit consumer do
+    createCmd QueryRequest with
+      requestId = "QR-001"
+      consumer
+      operator
+      auditor
+      params = sampleQueryParams
+      requestDate = now
+      createdAt = now
+
+  proposalCid <- submit operator do
+    exerciseCmd requestCid ProposeCost with
+      escrows = [escrow]
+      pricingConfigCid = pricingCid
+      metadata = samplePricingMetadata
+
+  proposal <- queryContractId consumer proposalCid
+  let p = fromSome proposal
+  assertMsg "Proposal should have correct consumer" (p.consumer == consumer)
+  assertMsg "Token cost should be positive" (p.tokenCost > 0)
+  assertMsg "Escrow should be in possibleEscrows" (escrow `elem` p.possibleEscrows)
+  assertMsg "No signer escrow yet" (p.signerEscrow == None)
+
+  pure ()
+
+testQueryRequestRequiresEscrow : Script ()
+testQueryRequestRequiresEscrow = do
+  TestParties{..} <- setupParties
+
+  now <- getTime
+  pricingCid <- setupPricingConfig operator auditor public
+
+  requestCid <- submit consumer do
+    createCmd QueryRequest with
+      requestId = "QR-002"
+      consumer
+      operator
+      auditor
+      params = sampleQueryParams
+      requestDate = now
+      createdAt = now
+
+  submitMustFail operator do
+    exerciseCmd requestCid ProposeCost with
+      escrows = []
+      pricingConfigCid = pricingCid
+      metadata = samplePricingMetadata
+
+  pure ()
+
+testRejectQueryRequest : Script ()
+testRejectQueryRequest = do
+  TestParties{..} <- setupParties
+
+  now <- getTime
+
+  requestCid <- submit consumer do
+    createCmd QueryRequest with
+      requestId = "QR-003"
+      consumer
+      operator
+      auditor
+      params = sampleQueryParams
+      requestDate = now
+      createdAt = now
+
+  submit operator do
+    exerciseCmd requestCid RejectQueryRequest with
+      reason = "Insufficient transaction data available"
+
+  request <- queryContractId consumer requestCid
+  assertMsg "Request should be archived" (request == None)
+
+  pure ()
+
+testWithdrawQueryRequest : Script ()
+testWithdrawQueryRequest = do
+  TestParties{..} <- setupParties
+
+  now <- getTime
+
+  requestCid <- submit consumer do
+    createCmd QueryRequest with
+      requestId = "QR-004"
+      consumer
+      operator
+      auditor
+      params = sampleQueryParams
+      requestDate = now
+      createdAt = now
+
+  submit consumer do
+    exerciseCmd requestCid WithdrawQueryRequest
+
+  request <- queryContractId consumer requestCid
+  assertMsg "Request should be archived" (request == None)
+
+  pure ()
+
+testEscrowAcceptsRole : Script ()
+testEscrowAcceptsRole = do
+  TestParties{..} <- setupParties
+
+  now <- getTime
+  pricingCid <- setupPricingConfig operator auditor public
+
+  requestCid <- submit consumer do
+    createCmd QueryRequest with
+      requestId = "QR-005"
+      consumer
+      operator
+      auditor
+      params = sampleQueryParams
+      requestDate = now
+      createdAt = now
+
+  proposalCid <- submit operator do
+    exerciseCmd requestCid ProposeCost with
+      escrows = [escrow, escrow2]
+      pricingConfigCid = pricingCid
+      metadata = samplePricingMetadata
+
+  updatedProposalCid <- submit escrow do
+    exerciseCmd proposalCid AcceptEscrowRole with acceptor = escrow
+
+  updatedProposal <- queryContractId consumer updatedProposalCid
+  assertMsg "Escrow should be signer" ((fromSome updatedProposal).signerEscrow == Some escrow)
+
+  pure ()
+
+testOnlyPossibleEscrowCanAccept : Script ()
+testOnlyPossibleEscrowCanAccept = do
+  TestParties{..} <- setupParties
+
+  now <- getTime
+  pricingCid <- setupPricingConfig operator auditor public
+
+  requestCid <- submit consumer do
+    createCmd QueryRequest with
+      requestId = "QR-006"
+      consumer
+      operator
+      auditor
+      params = sampleQueryParams
+      requestDate = now
+      createdAt = now
+
+  proposalCid <- submit operator do
+    exerciseCmd requestCid ProposeCost with
+      escrows = [escrow]  -- Only escrow, not escrow2
+      pricingConfigCid = pricingCid
+      metadata = samplePricingMetadata
+
+  submitMustFail escrow2 do
+    exerciseCmd proposalCid AcceptEscrowRole with acceptor = escrow2
+
+  pure ()
+
+testCannotAcceptIfEscrowAssigned : Script ()
+testCannotAcceptIfEscrowAssigned = do
+  TestParties{..} <- setupParties
+
+  now <- getTime
+  pricingCid <- setupPricingConfig operator auditor public
+
+  requestCid <- submit consumer do
+    createCmd QueryRequest with
+      requestId = "QR-007"
+      consumer
+      operator
+      auditor
+      params = sampleQueryParams
+      requestDate = now
+      createdAt = now
+
+  proposalCid <- submit operator do
+    exerciseCmd requestCid ProposeCost with
+      escrows = [escrow, escrow2]
+      pricingConfigCid = pricingCid
+      metadata = samplePricingMetadata
+
+  updatedProposalCid <- submit escrow do
+    exerciseCmd proposalCid AcceptEscrowRole with acceptor = escrow
+
+  submitMustFail escrow2 do
+    exerciseCmd updatedProposalCid AcceptEscrowRole with acceptor = escrow2
+
+  pure ()
+
+testSetPossibleEscrows : Script ()
+testSetPossibleEscrows = do
+  TestParties{..} <- setupParties
+
+  now <- getTime
+  pricingCid <- setupPricingConfig operator auditor public
+
+  requestCid <- submit consumer do
+    createCmd QueryRequest with
+      requestId = "QR-008"
+      consumer
+      operator
+      auditor
+      params = sampleQueryParams
+      requestDate = now
+      createdAt = now
+
+  proposalCid <- submit operator do
+    exerciseCmd requestCid ProposeCost with
+      escrows = [escrow]
+      pricingConfigCid = pricingCid
+      metadata = samplePricingMetadata
+
+  updatedCid <- submit operator do
+    exerciseCmd proposalCid SetPossibleEscrows with
+      newEscrows = [escrow2]
+
+  updatedProposal <- queryContractId consumer updatedCid
+  let p = fromSome updatedProposal
+  assertMsg "Escrow2 should be possible" (escrow2 `elem` p.possibleEscrows)
+  assertMsg "Original escrow should not be possible" (escrow `notElem` p.possibleEscrows)
+  assertMsg "Signer should be reset" (p.signerEscrow == None)
+
+  pure ()
+
+testRejectQueryProposal : Script ()
+testRejectQueryProposal = do
+  TestParties{..} <- setupParties
+
+  now <- getTime
+  pricingCid <- setupPricingConfig operator auditor public
+
+  requestCid <- submit consumer do
+    createCmd QueryRequest with
+      requestId = "QR-009"
+      consumer
+      operator
+      auditor
+      params = sampleQueryParams
+      requestDate = now
+      createdAt = now
+
+  proposalCid <- submit operator do
+    exerciseCmd requestCid ProposeCost with
+      escrows = [escrow]
+      pricingConfigCid = pricingCid
+      metadata = samplePricingMetadata
+
+  submit consumer do
+    exerciseCmd proposalCid RejectQueryProposal
+
+  proposal <- queryContractId consumer proposalCid
+  assertMsg "Proposal should be archived" (proposal == None)
+
+  pure ()
+
+testCompleteQueryWorkflow : Script ()
+testCompleteQueryWorkflow = do
+  TestParties{..} <- setupParties
+
+  now <- getTime
+  pricingCid <- setupPricingConfig operator auditor public
+
+  tokenMintAuthorityCid <- createTestMintAuthority operator auditor
+
+  requestCid <- submit consumer do
+    createCmd QueryRequest with
+      requestId = "QR-010"
+      consumer
+      operator
+      auditor
+      params = sampleQueryParams
+      requestDate = now
+      createdAt = now
+
+  proposalCid <- submit operator do
+    exerciseCmd requestCid ProposeCost with
+      escrows = [escrow]
+      pricingConfigCid = pricingCid
+      metadata = samplePricingMetadata
+
+  proposal <- queryContractId consumer proposalCid
+  let tokenCost = (fromSome proposal).tokenCost
+
+  acceptedProposalCid <- submit escrow do
+    exerciseCmd proposalCid AcceptEscrowRole with acceptor = escrow
+
+  holdingCid <- createHolding operator auditor consumer (tokenCost + 1000)
+
+  fundedQueryCid <- submitMulti [consumer] [operator, escrow] do
+    exerciseCmd acceptedProposalCid LockFundsForQuery with
+      payedHoldingCid = holdingCid
+
+  fundedQuery <- queryContractId consumer fundedQueryCid
+  let fq = fromSome fundedQuery
+  assertMsg "Funded query should have correct consumer" (fq.consumer == consumer)
+  assertMsg "Funded query should have correct escrow" (fq.escrow == escrow)
+
+  let sampleInsight = Level1 with
+        base = InsightBase with
+          transactionCount = 100
+          avgSalePrice = Some 500000.0
+          avgTrustScore = Some 0.85
+          avgYearBuilt = Some 2000.0
+          avgSquareMeters = Some 100.0
+          avgNumberOfRooms = Some 4.0
+          medianEnergyRating = Some B
+
+  executionTime <- getTime
+
+  (resultCid, rewardCid) <- submit operator do
+    exerciseCmd fundedQueryCid CompleteQuery with
+      queryResults = [sampleInsight]
+      executionTimestamp = executionTime
+      tokenMintAuthorityCid
+
+  result <- queryContractId consumer resultCid
+  let r = fromSome result
+  assertMsg "Result should have insights" (not $ null r.results)
+
+  pure ()
+
+testLockFundsRequiresEscrow : Script ()
+testLockFundsRequiresEscrow = do
+  TestParties{..} <- setupParties
+
+  now <- getTime
+  pricingCid <- setupPricingConfig operator auditor public
+
+  requestCid <- submit consumer do
+    createCmd QueryRequest with
+      requestId = "QR-011"
+      consumer
+      operator
+      auditor
+      params = sampleQueryParams
+      requestDate = now
+      createdAt = now
+
+  proposalCid <- submit operator do
+    exerciseCmd requestCid ProposeCost with
+      escrows = [escrow]
+      pricingConfigCid = pricingCid
+      metadata = samplePricingMetadata
+
+  proposal <- queryContractId consumer proposalCid
+  let tokenCost = (fromSome proposal).tokenCost
+
+  holdingCid <- createHolding operator auditor consumer (tokenCost + 1000)
+
+  submitMustFail consumer do
+    exerciseCmd proposalCid LockFundsForQuery with
+      payedHoldingCid = holdingCid
+
+  pure ()
+
+testLockFundsInsufficientBalance : Script ()
+testLockFundsInsufficientBalance = do
+  TestParties{..} <- setupParties
+
+  now <- getTime
+  pricingCid <- setupPricingConfig operator auditor public
+
+  requestCid <- submit consumer do
+    createCmd QueryRequest with
+      requestId = "QR-012"
+      consumer
+      operator
+      auditor
+      params = sampleQueryParams
+      requestDate = now
+      createdAt = now
+
+  proposalCid <- submit operator do
+    exerciseCmd requestCid ProposeCost with
+      escrows = [escrow]
+      pricingConfigCid = pricingCid
+      metadata = samplePricingMetadata
+
+  proposal <- queryContractId consumer proposalCid
+  let tokenCost = (fromSome proposal).tokenCost
+
+  acceptedProposalCid <- submit escrow do
+    exerciseCmd proposalCid AcceptEscrowRole with acceptor = escrow
+
+  holdingCid <- createHolding operator auditor consumer 1  -- way less than tokenCost
+
+  submitMustFail consumer do
+    exerciseCmd acceptedProposalCid LockFundsForQuery with
+      payedHoldingCid = holdingCid
+
+  pure ()
+
+testLockFundsSplitsHolding : Script ()
+testLockFundsSplitsHolding = do
+  TestParties{..} <- setupParties
+
+  now <- getTime
+  pricingCid <- setupPricingConfig operator auditor public
+
+  requestCid <- submit consumer do
+    createCmd QueryRequest with
+      requestId = "QR-SPLIT-001"
+      consumer
+      operator
+      auditor
+      params = sampleQueryParams
+      requestDate = now
+      createdAt = now
+
+  proposalCid <- submit operator do
+    exerciseCmd requestCid ProposeCost with
+      escrows = [escrow]
+      pricingConfigCid = pricingCid
+      metadata = samplePricingMetadata
+
+  proposal <- queryContractId consumer proposalCid
+  let tokenCost = (fromSome proposal).tokenCost
+
+  acceptedProposalCid <- submit escrow do
+    exerciseCmd proposalCid AcceptEscrowRole with acceptor = escrow
+
+  let totalTokens = tokenCost * 2
+  holdingCid <- createHolding operator auditor consumer totalTokens
+
+  fundedQueryCid <- submit consumer do
+    exerciseCmd acceptedProposalCid LockFundsForQuery with
+      payedHoldingCid = holdingCid
+
+  consumerHoldings <- query @Holding consumer
+  let remainderHoldings = filter (\(_, h) -> h.owner == consumer && h.amount == tokenCost) consumerHoldings
+  assertMsg "Consumer should retain remainder tokens" (not $ null remainderHoldings)
+
+  escrowHoldings <- query @Holding escrow
+  let lockedPayments = filter (\(_, h) -> h.owner == escrow && h.amount == tokenCost && isSome h.locker) escrowHoldings
+  assertMsg "Escrow should have locked payment tokens" (not $ null lockedPayments)
+
+  pure ()
+
+testFailQueryReleasesFunds : Script ()
+testFailQueryReleasesFunds = do
+  TestParties{..} <- setupParties
+
+  now <- getTime
+  pricingCid <- setupPricingConfig operator auditor public
+
+  requestCid <- submit consumer do
+    createCmd QueryRequest with
+      requestId = "QR-013"
+      consumer
+      operator
+      auditor
+      params = sampleQueryParams
+      requestDate = now
+      createdAt = now
+
+  proposalCid <- submit operator do
+    exerciseCmd requestCid ProposeCost with
+      escrows = [escrow]
+      pricingConfigCid = pricingCid
+      metadata = samplePricingMetadata
+
+  proposal <- queryContractId consumer proposalCid
+  let tokenCost = (fromSome proposal).tokenCost
+
+  acceptedProposalCid <- submit escrow do
+    exerciseCmd proposalCid AcceptEscrowRole with acceptor = escrow
+
+  holdingCid <- createHolding operator auditor consumer (tokenCost + 1000)
+
+  fundedQueryCid <- submitMulti [consumer] [operator, escrow] do
+    exerciseCmd acceptedProposalCid LockFundsForQuery with
+      payedHoldingCid = holdingCid
+
+  returnedHoldingCid <- submit operator do
+    exerciseCmd fundedQueryCid FailQuery with
+      failureReason = "No data available for the query parameters"
+
+  returnedHolding <- queryContractId consumer returnedHoldingCid
+  let rh = fromSome returnedHolding
+  assertMsg "Funds should return to consumer" (rh.owner == consumer)
+  assertMsg "Full amount should be returned" (rh.amount >= tokenCost)
+
+  pure ()
+
+testConsumerReclaimsExpiredFunds : Script ()
+testConsumerReclaimsExpiredFunds = do
+  TestParties{..} <- setupParties
+
+  now <- getTime
+  pricingCid <- setupPricingConfig operator auditor public
+
+  requestCid <- submit consumer do
+    createCmd QueryRequest with
+      requestId = "QR-014"
+      consumer
+      operator
+      auditor
+      params = sampleQueryParams
+      requestDate = now
+      createdAt = now
+
+  proposalCid <- submit operator do
+    exerciseCmd requestCid ProposeCost with
+      escrows = [escrow]
+      pricingConfigCid = pricingCid
+      metadata = samplePricingMetadata
+
+  proposal <- queryContractId consumer proposalCid
+  let tokenCost = (fromSome proposal).tokenCost
+
+  acceptedProposalCid <- submit escrow do
+    exerciseCmd proposalCid AcceptEscrowRole with acceptor = escrow
+
+  holdingCid <- createHolding operator auditor consumer (tokenCost + 1000)
+
+  fundedQueryCid <- submitMulti [consumer] [operator, escrow] do
+    exerciseCmd acceptedProposalCid LockFundsForQuery with
+      payedHoldingCid = holdingCid
+
+  submitMustFail consumer do
+    exerciseCmd fundedQueryCid ReclaimExpiredFunds
+
+  passTime (days 1)
+
+  returnedHoldingCid <- submit consumer do
+    exerciseCmd fundedQueryCid ReclaimExpiredFunds
+
+  returnedHolding <- queryContractId consumer returnedHoldingCid
+  let rh = fromSome returnedHolding
+  assertMsg "Funds should return to the consumer" (rh.owner == consumer)
+  assertMsg "Full amount should be returned" (rh.amount >= tokenCost)
+  assertMsg "Returned holding must not still be locked" (isNone rh.locker)
+
+  pure ()
+
+testReclaimExpiredFundsRejectsOtherParties : Script ()
+testReclaimExpiredFundsRejectsOtherParties = do
+  TestParties{..} <- setupParties
+
+  now <- getTime
+  pricingCid <- setupPricingConfig operator auditor public
+
+  requestCid <- submit consumer do
+    createCmd QueryRequest with
+      requestId = "QR-015"
+      consumer
+      operator
+      auditor
+      params = sampleQueryParams
+      requestDate = now
+      createdAt = now
+
+  proposalCid <- submit operator do
+    exerciseCmd requestCid ProposeCost with
+      escrows = [escrow]
+      pricingConfigCid = pricingCid
+      metadata = samplePricingMetadata
+
+  proposal <- queryContractId consumer proposalCid
+  let tokenCost = (fromSome proposal).tokenCost
+
+  acceptedProposalCid <- submit escrow do
+    exerciseCmd proposalCid AcceptEscrowRole with acceptor = escrow
+
+  holdingCid <- createHolding operator auditor consumer (tokenCost + 1000)
+
+  fundedQueryCid <- submitMulti [consumer] [operator, escrow] do
+    exerciseCmd acceptedProposalCid LockFundsForQuery with
+      payedHoldingCid = holdingCid
+
+  passTime (days 1)
+
+  submitMustFail escrow do
+    exerciseCmd fundedQueryCid ReclaimExpiredFunds
+
+  submitMustFail operator do
+    exerciseCmd fundedQueryCid ReclaimExpiredFunds
+
+  pure ()
+
+testLevel2HigherCostThanLevel1 : Script ()
+testLevel2HigherCostThanLevel1 = do
+  TestParties{..} <- setupParties
+
+  now <- getTime
+  pricingCid <- setupPricingConfig operator auditor public
+
+  request1Cid <- submit consumer do
+    createCmd QueryRequest with
+      requestId = "QR-014"
+      consumer
+      operator
+      auditor
+      params = sampleQueryParams with level = 1
+      requestDate = now
+      createdAt = now
+
+  proposal1Cid <- submit operator do
+    exerciseCmd request1Cid ProposeCost with
+      escrows = [escrow]
+      pricingConfigCid = pricingCid
+      metadata = samplePricingMetadata
+
+  proposal1 <- queryContractId consumer proposal1Cid
+  let level1Cost = (fromSome proposal1).tokenCost
+
+  request2Cid <- submit consumer do
+    createCmd QueryRequest with
+      requestId = "QR-015"
+      consumer
+      operator
+      auditor
+      params = sampleQueryParams with level = 2
+      requestDate = now
+      createdAt = now
+
+  proposal2Cid <- submit operator do
+    exerciseCmd request2Cid ProposeCost with
+      escrows = [escrow]
+      pricingConfigCid = pricingCid
+      metadata = samplePricingMetadata
+
+  proposal2 <- queryContractId consumer proposal2Cid
+  let level2Cost = (fromSome proposal2).tokenCost
+
+  assertMsg "Level 2 should cost more than Level 1" (level2Cost > level1Cost)
+
+  pure ()
+
+testMoreTransactionsCostsMore : Script ()
+testMoreTransactionsCostsMore = do
+  TestParties{..} <- setupParties
+
+  now <- getTime
+  pricingCid <- setupPricingConfig operator auditor public
+
+  request1Cid <- submit consumer do
+    createCmd QueryRequest with
+      requestId = "QR-016"
+      consumer
+      operator
+      auditor
+      params = sampleQueryParams
+      requestDate = now
+      createdAt = now
+
+  proposal1Cid <- submit operator do
+    exerciseCmd request1Cid ProposeCost with
+      escrows = [escrow]
+      pricingConfigCid = pricingCid
+      metadata = samplePricingMetadata with numTransactions = 10
+
+  proposal1 <- queryContractId consumer proposal1Cid
+  let fewTxCost = (fromSome proposal1).tokenCost
+
+  request2Cid <- submit consumer do
+    createCmd QueryRequest with
+      requestId = "QR-017"
+      consumer
+      operator
+      auditor
+      params = sampleQueryParams
+      requestDate = now
+      createdAt = now
+
+  proposal2Cid <- submit operator do
+    exerciseCmd request2Cid ProposeCost with
+      escrows = [escrow]
+      pricingConfigCid = pricingCid
+      metadata = samplePricingMetadata with numTransactions = 1000
+
+  proposal2 <- queryContractId consumer proposal2Cid
+  let manyTxCost = (fromSome proposal2).tokenCost
+
+  assertMsg "More transactions should cost more" (manyTxCost > fewTxCost)
+
+  pure ()
+
+testFundedQueryCarriesProposalId : Script ()
+testFundedQueryCarriesProposalId = do
+  TestParties{..} <- setupParties
+
+  now <- getTime
+  pricingCid <- setupPricingConfig operator auditor public
+
+  requestCid <- submit consumer do
+    createCmd QueryRequest with
+      requestId = "QR-018"
+      consumer
+      operator
+      auditor
+      params = sampleQueryParams
+      requestDate = now
+      createdAt = now
+
+  proposalCid <- submit operator do
+    exerciseCmd requestCid ProposeCost with
+      escrows = [escrow]
+      pricingConfigCid = pricingCid
+      metadata = samplePricingMetadata
+
+  proposal <- queryContractId consumer proposalCid
+  let proposalId = (fromSome proposal).proposalId
+  let tokenCost = (fromSome proposal).tokenCost
+
+  acceptedProposalCid <- submit escrow do
+    exerciseCmd proposalCid AcceptEscrowRole with acceptor = escrow
+
+  holdingCid <- createHolding operator auditor consumer (tokenCost + 1000)
+
+  fundedQueryCid <- submitMulti [consumer] [operator, escrow] do
+    exerciseCmd acceptedProposalCid LockFundsForQuery with
+      payedHoldingCid = holdingCid
+
+  fundedQuery <- queryContractId consumer fundedQueryCid
+  assertMsg "FundedQuery should have proposalId" ((fromSome fundedQuery).proposalId == proposalId)
+
+  pure ()
+
+createHoldingCustom : Party -> Party -> Party -> Int -> TokenType -> Script (ContractId Holding)
+createHoldingCustom issuer witness owner amount tokenType = do
+  now <- getTime
+  submitMulti [issuer, witness, owner] [] do
+    createCmd Holding with
+      owner
+      issuer
+      witness
+      tokenType
+      amount
+      locker = None
+      lockReleaseTime = None
+      createdAt = now
+
+testLockFundsWrongTokenType : Script ()
+testLockFundsWrongTokenType = do
+  TestParties{..} <- setupParties
+
+  now <- getTime
+  pricingCid <- setupPricingConfig operator auditor public
+
+  requestCid <- submit consumer do
+    createCmd QueryRequest with
+      requestId = "QR-WRONG-TOKEN"
+      consumer
+      operator
+      auditor
+      params = sampleQueryParams
+      requestDate = now
+      createdAt = now
+
+  proposalCid <- submit operator do
+    exerciseCmd requestCid ProposeCost with
+      escrows = [escrow]
+      pricingConfigCid = pricingCid
+      metadata = samplePricingMetadata
+
+  proposal <- queryContractId consumer proposalCid
+  let tokenCost = (fromSome proposal).tokenCost
+
+  acceptedProposalCid <- submit escrow do
+    exerciseCmd proposalCid AcceptEscrowRole with acceptor = escrow
+
+  holdingCid <- createHoldingCustom operator auditor consumer (tokenCost + 1000) AuditToken
+
+  submitMustFail consumer do
+    exerciseCmd acceptedProposalCid LockFundsForQuery with
+      payedHoldingCid = holdingCid
+
+  pure ()
+
+testLockFundsWrongIssuer : Script ()
+testLockFundsWrongIssuer = do
+  TestParties{..} <- setupParties
+  wrongIssuer <- allocateParty "WrongIssuer"
+
+  now <- getTime
+  pricingCid <- setupPricingConfig operator auditor public
+
+  requestCid <- submit consumer do
+    createCmd QueryRequest with
+      requestId = "QR-WRONG-ISSUER"
+      consumer
+      operator
+      auditor
+      params = sampleQueryParams
+      requestDate = now
+      createdAt = now
+
+  proposalCid <- submit operator do
+    exerciseCmd requestCid ProposeCost with
+      escrows = [escrow]
+      pricingConfigCid = pricingCid
+      metadata = samplePricingMetadata
+
+  proposal <- queryContractId consumer proposalCid
+  let tokenCost = (fromSome proposal).tokenCost
+
+  acceptedProposalCid <- submit escrow do
+    exerciseCmd proposalCid AcceptEscrowRole with acceptor = escrow
+
+  holdingCid <- createHoldingCustom wrongIssuer auditor consumer (tokenCost + 1000) RewardToken
+
+  submitMustFail consumer do
+    exerciseCmd acceptedProposalCid LockFundsForQuery with
+      payedHoldingCid = holdingCid
+
+  pure ()
+
+testLockFundsWrongWitness : Script ()
+testLockFundsWrongWitness = do
+  TestParties{..} <- setupParties
+  wrongWitness <- allocateParty "WrongWitness"
+
+  now <- getTime
+  pricingCid <- setupPricingConfig operator auditor public
+
+  requestCid <- submit consumer do
+    createCmd QueryRequest with
+      requestId = "QR-WRONG-WITNESS"
+      consumer
+      operator
+      auditor
+      params = sampleQueryParams
+      requestDate = now
+      createdAt = now
+
+  proposalCid <- submit operator do
+    exerciseCmd requestCid ProposeCost with
+      escrows = [escrow]
+      pricingConfigCid = pricingCid
+      metadata = samplePricingMetadata
+
+  proposal <- queryContractId consumer proposalCid
+  let tokenCost = (fromSome proposal).tokenCost
+
+  acceptedProposalCid <- submit escrow do
+    exerciseCmd proposalCid AcceptEscrowRole with acceptor = escrow
+
+  holdingCid <- createHoldingCustom operator wrongWitness consumer (tokenCost + 1000) RewardToken
+
+  submitMustFail consumer do
+    exerciseCmd acceptedProposalCid LockFundsForQuery with
+      payedHoldingCid = holdingCid
+
+  pure ()
+
+-- The privacy floor is enforced on the ledger at two points, pricing and delivery, so an
+-- operator that drops its own check still cannot sell an aggregate over too few transactions.
+
+testProposeCostRejectsBelowPrivacyFloor : Script ()
+testProposeCostRejectsBelowPrivacyFloor = do
+  TestParties{..} <- setupParties
+
+  now <- getTime
+  pricingCid <- setupPricingConfig operator auditor public
+
+  requestCid <- submit consumer do
+    createCmd QueryRequest with
+      requestId = "QR-PRIVACY-PRICE"
+      consumer
+      operator
+      auditor
+      params = sampleQueryParams
+      requestDate = now
+      createdAt = now
+
+  -- Zero matters on its own: log2(1 + n) collapses there and the price is clamped up to 1 token.
+  submitMustFail operator do
+    exerciseCmd requestCid ProposeCost with
+      escrows = [escrow]
+      pricingConfigCid = pricingCid
+      metadata = samplePricingMetadata with numTransactions = _minTransactionsForPrivacy_ - 1
+
+  submitMustFail operator do
+    exerciseCmd requestCid ProposeCost with
+      escrows = [escrow]
+      pricingConfigCid = pricingCid
+      metadata = samplePricingMetadata with numTransactions = 0
+
+  proposalCid <- submit operator do
+    exerciseCmd requestCid ProposeCost with
+      escrows = [escrow]
+      pricingConfigCid = pricingCid
+      metadata = samplePricingMetadata with numTransactions = _minTransactionsForPrivacy_
+
+  proposal <- queryContractId consumer proposalCid
+  assertMsg "A query exactly at the floor is priced" (isSome proposal)
+
+  pure ()
+
+setupFundedQuery : TestParties -> Text -> Script (ContractId FundedQuery)
+setupFundedQuery TestParties{..} requestId = do
+  now <- getTime
+  pricingCid <- setupPricingConfig operator auditor public
+
+  requestCid <- submit consumer do
+    createCmd QueryRequest with
+      requestId
+      consumer
+      operator
+      auditor
+      params = sampleQueryParams
+      requestDate = now
+      createdAt = now
+
+  proposalCid <- submit operator do
+    exerciseCmd requestCid ProposeCost with
+      escrows = [escrow]
+      pricingConfigCid = pricingCid
+      metadata = samplePricingMetadata
+
+  proposal <- queryContractId consumer proposalCid
+  let tokenCost = (fromSome proposal).tokenCost
+
+  acceptedProposalCid <- submit escrow do
+    exerciseCmd proposalCid AcceptEscrowRole with acceptor = escrow
+
+  holdingCid <- createHolding operator auditor consumer (tokenCost + 1000)
+
+  submitMulti [consumer] [operator, escrow] do
+    exerciseCmd acceptedProposalCid LockFundsForQuery with
+      payedHoldingCid = holdingCid
+
+-- A query priced over enough transactions can lose them to disputes before it is funded. The
+-- delivery is refused, and FailQuery must still be reachable to refund the consumer.
+testCompleteQueryRejectsBelowPrivacyFloor : Script ()
+testCompleteQueryRejectsBelowPrivacyFloor = do
+  parties@TestParties{..} <- setupParties
+  tokenMintAuthorityCid <- createTestMintAuthority operator auditor
+  fundedQueryCid <- setupFundedQuery parties "QR-PRIVACY-DELIVER"
+
+  executionTime <- getTime
+
+  let insightOver n = Level1 with
+        base = InsightBase with
+          transactionCount = n
+          avgSalePrice = Some 500000.0
+          avgTrustScore = Some 0.85
+          avgYearBuilt = Some 2000.0
+          avgSquareMeters = Some 100.0
+          avgNumberOfRooms = Some 4.0
+          medianEnergyRating = Some B
+
+  submitMustFail operator do
+    exerciseCmd fundedQueryCid CompleteQuery with
+      queryResults = [insightOver (_minTransactionsForPrivacy_ - 1)]
+      executionTimestamp = executionTime
+      tokenMintAuthorityCid
+
+  -- every insight must clear the floor, or a targeted one could ride along with a broad one
+  submitMustFail operator do
+    exerciseCmd fundedQueryCid CompleteQuery with
+      queryResults = [insightOver 100, insightOver 1]
+      executionTimestamp = executionTime
+      tokenMintAuthorityCid
+
+  -- `all` over an empty list is True
+  submitMustFail operator do
+    exerciseCmd fundedQueryCid CompleteQuery with
+      queryResults = []
+      executionTimestamp = executionTime
+      tokenMintAuthorityCid
+
+  refundedCid <- submit operator do
+    exerciseCmd fundedQueryCid FailQuery with
+      failureReason = "too few transactions still active to preserve contributor privacy"
+
+  refunded <- queryContractId consumer refundedCid
+  assertMsg "Consumer gets the payment back" ((fromSome refunded).owner == consumer)
+
+  pure ()
+
+testCompleteQueryAtPrivacyFloorSucceeds : Script ()
+testCompleteQueryAtPrivacyFloorSucceeds = do
+  parties@TestParties{..} <- setupParties
+  tokenMintAuthorityCid <- createTestMintAuthority operator auditor
+  fundedQueryCid <- setupFundedQuery parties "QR-PRIVACY-BOUNDARY"
+
+  executionTime <- getTime
+
+  (resultCid, _rewardCid) <- submit operator do
+    exerciseCmd fundedQueryCid CompleteQuery with
+      queryResults =
+        [ Level1 with
+            base = InsightBase with
+              transactionCount = _minTransactionsForPrivacy_
+              avgSalePrice = Some 500000.0
+              avgTrustScore = Some 0.85
+              avgYearBuilt = Some 2000.0
+              avgSquareMeters = Some 100.0
+              avgNumberOfRooms = Some 4.0
+              medianEnergyRating = Some B
+        ]
+      executionTimestamp = executionTime
+      tokenMintAuthorityCid
+
+  result <- queryContractId consumer resultCid
+  assertMsg "A query exactly at the floor is delivered" (isSome result)
+
+  pure ()
+
+testExpireQueryProposal : Script ()
+testExpireQueryProposal = do
+  TestParties{..} <- setupParties
+
+  now <- getTime
+  pricingCid <- setupPricingConfig operator auditor public
+
+  requestCid <- submit consumer do
+    createCmd QueryRequest with
+      requestId = "QR-EXPIRE-1"
+      consumer
+      operator
+      auditor
+      params = sampleQueryParams
+      requestDate = now
+      createdAt = now
+
+  proposalCid <- submit operator do
+    exerciseCmd requestCid ProposeCost with
+      escrows = [escrow]
+      pricingConfigCid = pricingCid
+      metadata = samplePricingMetadata
+
+  submit operator do
+    exerciseCmd proposalCid ExpireQueryProposal with
+      reason = "contribution-set lease ran out before funding"
+
+  proposal <- queryContractId consumer proposalCid
+  assertMsg "an expired quote is withdrawn from the ledger" (proposal == None)
+
+testOnlyOperatorCanExpireQueryProposal : Script ()
+testOnlyOperatorCanExpireQueryProposal = do
+  TestParties{..} <- setupParties
+
+  now <- getTime
+  pricingCid <- setupPricingConfig operator auditor public
+
+  requestCid <- submit consumer do
+    createCmd QueryRequest with
+      requestId = "QR-EXPIRE-2"
+      consumer
+      operator
+      auditor
+      params = sampleQueryParams
+      requestDate = now
+      createdAt = now
+
+  proposalCid <- submit operator do
+    exerciseCmd requestCid ProposeCost with
+      escrows = [escrow]
+      pricingConfigCid = pricingCid
+      metadata = samplePricingMetadata
+
+  submitMustFail consumer do
+    exerciseCmd proposalCid ExpireQueryProposal with reason = "expiring it myself"
+
+  submitMustFail operator do
+    exerciseCmd proposalCid ExpireQueryProposal with reason = ""
+
+  stillThere <- queryContractId consumer proposalCid
+  assertMsg "a refused expiry leaves the quote standing" (stillThere /= None)
